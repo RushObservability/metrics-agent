@@ -184,6 +184,16 @@ The final image uses a Chainguard Rust builder and glibc-dynamic runtime. It
 runs as UID 65532, has no shell or package manager, and uses a read-only
 filesystem with Linux capabilities dropped.
 
+For a security-focused installation, start with
+examples/values-secure.yaml. Pin image.digest to a release digest and replace
+the example NetworkPolicy egress rules with the exact Kubernetes API-server,
+DNS, scrape-target, and Rush/query-api destinations for your cluster.
+
+The chart deploys exactly one metrics-agent replica. Values other than
+replicaCount: 1 are rejected until the controller supports leader election.
+The optional VMAgent integration is disabled by default; enabling it creates a
+separate VMAgent workload.
+
 ## Configuration
 
 CLI flags and environment variables use the same names. The most commonly used
@@ -269,11 +279,15 @@ Then query Rush through query-api:
 - The controller reads supported scrape CRDs and patches only the managed
   VictoriaMetrics precedence annotation and, when explicitly requested, the
   matching owner reference.
+- The default ServiceAccount uses only the cluster-scoped read/watch permissions
+  required for scrape discovery plus patch access to the supported VictoriaMetrics
+  scrape resources; it has no Events write permission.
 - The container runs non-root with a read-only filesystem and all Linux
-  capabilities dropped.
+  capabilities dropped, privilege escalation disabled, RuntimeDefault seccomp,
+  and host namespaces disabled.
 - Store remote-write tokens in Kubernetes Secrets or another secret manager.
-- Keep networkPolicy.enabled off only when the cluster API server, DNS, and
-  remote-write egress rules are managed elsewhere.
+- NetworkPolicy is configurable and empty ingress/egress lists are deny-all;
+  enable it with cluster-specific rules for production deployments.
 - Inspect /readyz, /metrics, and .remote_write in /api/v1/status when collection
   or delivery is degraded.
 

@@ -13,9 +13,6 @@ rules:
     resources: ["vmservicescrapes", "vmpodscrapes", "vmprobes", "vmscrapeconfigs"]
     verbs: ["get", "list", "watch", "patch"]
   - apiGroups: [""]
-    resources: ["events"]
-    verbs: ["create", "patch", "update"]
-  - apiGroups: [""]
     resources: ["services", "endpoints", "pods"]
     verbs: ["get", "list", "watch"]
 ---

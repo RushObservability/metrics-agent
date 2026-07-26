@@ -1,0 +1,44 @@
+# Security-focused example. Replace the egress destinations with the exact
+# Kubernetes API-server and Rush/query-api CIDRs or namespace selectors for
+# your cluster.
+replicaCount: 1
+
+image:
+  repository: ghcr.io/rushobservability/metrics-agent
+  digest: sha256:replace_with_a_release_digest
+
+networkPolicy:
+  enabled: true
+  ingress:
+    # Allow only same-namespace clients such as a local Prometheus/ServiceMonitor.
+    - from:
+        - podSelector: {}
+      ports:
+        - protocol: TCP
+          port: 7070
+  egress:
+    # Cluster DNS.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Replace these broad port rules with ipBlock or namespace/pod selectors
+    # where your cluster topology allows it.
+    - ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 8080
+
+rushRemoteWrite:
+  enabled: true
+  url: https://rush-query-api.example.com/prom/api/v1/write
+  tenant: example
+  bearerTokenSecret:
+    name: rush-remote-write
+    key: token

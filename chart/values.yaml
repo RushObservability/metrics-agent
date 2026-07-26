@@ -2,11 +2,15 @@ image:
   repository: ghcr.io/rushobservability/metrics-agent
   pullPolicy: IfNotPresent
   tag: ""
+  # Prefer a digest in production. When set, digest takes precedence over tag.
+  digest: ""
 
 imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
+# The controller is intentionally single-replica until leader election is
+# implemented. The deployment template rejects values other than one.
 replicaCount: 1
 
 controller:
@@ -21,6 +25,8 @@ scrape:
 
 serviceAccount:
   create: true
+  # The controller needs a projected Kubernetes token to watch cluster-scoped
+  # resources. Kubernetes rotates this token automatically.
   automountServiceAccountToken: true
   annotations: {}
   name: ""
@@ -36,11 +42,16 @@ podSecurityContext:
   runAsUser: 65532
   runAsGroup: 65532
   fsGroup: 65532
+  fsGroupChangePolicy: OnRootMismatch
   seccompProfile:
     type: RuntimeDefault
 
 securityContext:
+  privileged: false
   allowPrivilegeEscalation: false
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
   readOnlyRootFilesystem: true
   capabilities:
     drop:
@@ -53,6 +64,16 @@ resources:
   limits:
     cpu: 200m
     memory: 128Mi
+
+# Explicitly disable host namespace sharing and service-link environment
+# injection. The agent only needs network access to the Kubernetes API and its
+# configured scrape/remote-write endpoints.
+hostNetwork: false
+hostPID: false
+hostIPC: false
+shareProcessNamespace: false
+enableServiceLinks: false
+terminationGracePeriodSeconds: 30
 
 nodeSelector: {}
 tolerations: []
@@ -169,7 +190,9 @@ precedence:
 
 networkPolicy:
   enabled: false
-  # Add ingress/egress rules appropriate for the cluster when enabled. An empty
-  # list is intentionally deny-all under Kubernetes NetworkPolicy semantics.
+  # NetworkPolicy cannot identify the Kubernetes API server or a remote-write
+  # destination portably across clusters. Set enabled=true and provide the
+  # narrowest ingress/egress rules for your cluster; empty lists are deny-all.
+  # See examples/values-secure.yaml.
   ingress: []
   egress: []
