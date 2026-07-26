@@ -158,7 +158,7 @@ the one to inspect.
 
 Build and publish the image, or use a release image from GHCR:
 
-    helm upgrade --install metrics-agent ./chart \
+    helm upgrade --install metrics-agent ./helm-chart \
       --namespace monitoring \
       --create-namespace \
       --set image.repository=ghcr.io/rushobservability/metrics-agent \
@@ -215,7 +215,7 @@ settings are:
 | METRICS_AGENT_SCRAPE_TIMEOUT | 10s | Per-target HTTP timeout |
 | METRICS_AGENT_VERSION | dev | Version shown in status and UI |
 
-The Helm chart exposes these through chart/values.yaml, including UI, security
+The Helm chart exposes these through helm-chart/values.yaml, including UI, security
 context, resources, ServiceMonitor, NetworkPolicy, and direct Rush remote-write
 settings.
 
