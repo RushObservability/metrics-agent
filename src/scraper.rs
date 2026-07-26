@@ -1,8 +1,8 @@
 //! Lightweight Prometheus scraping from the Kubernetes scrape CRDs.
 //!
 //! This intentionally implements the common ServiceMonitor/PodMonitor and
-//! static target shapes directly instead of depending on vmagent or
-//! VictoriaMetrics. The controller remains useful when those operators are
+//! static target shapes directly instead of depending on an external scrape
+//! agent or VictoriaMetrics. The controller remains useful when those operators are
 //! not installed, while native VM scrape objects can still be used as input.
 
 use std::{
