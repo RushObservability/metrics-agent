@@ -20,6 +20,11 @@ usage, discovered CRDs, scrape status, and per-CRD metric cardinality.
 > metrics-agent is normally deployed as part of a [Rush](https://github.com/RushObservability)
 > installation. It publishes workload metrics directly to Rush.
 
+![metrics-agent control surface](docs/metrics-agent-ui.jpg)
+
+The embedded control surface gives operators a live view of CRD discovery,
+collection health, process resource usage, and Rush publishing.
+
 ## Why use metrics-agent?
 
 Use metrics-agent when you want to discover and collect the scrape configuration
