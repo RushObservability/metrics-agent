@@ -334,6 +334,5 @@ metrics-agent is normally deployed alongside:
 
 ## License
 
-The Rust package declares Apache-2.0 in Cargo.toml. The Helm chart currently
-contains a separate Artifact Hub license annotation; keep those metadata values
-aligned before publishing a license badge or standalone chart release.
+The project is licensed under Apache License 2.0. See [LICENSE](LICENSE) for
+the complete terms; the Rust package and Helm chart metadata use Apache-2.0.
