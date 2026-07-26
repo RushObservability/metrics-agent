@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" content="#0f1217" />
+    <title>Metrics Agent / Collection Control</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <a class="wordmark" href="./" aria-label="Metrics Agent home">
+          <span class="wordmark-mark" aria-hidden="true"></span>
+          <span>RUSH</span>
+        </a>
+        <div class="topbar-context">
+          <span class="context-slash">/</span>
+          <span>METRICS AGENT</span>
+          <span class="context-muted">COLLECTION CONTROL</span>
+        </div>
+        <div class="topbar-actions">
+          <span id="pollStatus" class="poll-status" role="status" aria-live="polite">Starting poll</span>
+          <button id="pollToggle" class="button button-quiet" type="button" aria-pressed="false">Pause polling</button>
+          <button id="refreshButton" class="button button-refresh" type="button">
+            <span>Refresh</span>
+          </button>
+        </div>
+      </header>
+
+      <main class="page-frame">
+        <section class="intro" aria-labelledby="pageTitle">
+          <div>
+            <p class="eyebrow">RUNTIME / COLLECTION</p>
+            <h1 id="pageTitle">Metrics agent</h1>
+            <p class="intro-copy">A live view of the scrape CRDs, discovered targets, collected samples, and precedence paths managed by this agent.</p>
+          </div>
+          <div id="connectionState" class="connection-state connection-state-pending" role="status" aria-live="polite">
+            <span class="state-dot" aria-hidden="true"></span>
+            <span class="state-copy">
+              <strong id="connectionLabel">Awaiting status</strong>
+              <span id="connectionDetail">Connecting to the agent runtime</span>
+            </span>
+          </div>
+        </section>
+
+        <div id="errorBanner" class="error-banner" role="alert" hidden>
+          <span class="error-mark" aria-hidden="true">!</span>
+          <div>
+            <strong>Agent status is unavailable</strong>
+            <span id="errorMessage">The control surface could not reach the metrics agent.</span>
+          </div>
+          <button id="errorRetry" class="button button-small" type="button">Try again</button>
+        </div>
+
+        <section class="inventory" aria-labelledby="inventoryTitle">
+          <div class="section-heading">
+            <div>
+              <p class="eyebrow">LIVE INVENTORY</p>
+              <h2 id="inventoryTitle">Collection footprint</h2>
+            </div>
+            <span id="lastUpdated" class="last-updated">No sample yet</span>
+          </div>
+          <div class="readout-grid">
+            <article class="readout readout-primary">
+              <span class="readout-label">CRD objects</span>
+              <strong id="crdObjects" class="readout-value">—</strong>
+              <span class="readout-note">objects in the active watch set</span>
+            </article>
+            <article class="readout">
+              <span class="readout-label">Resource pairs</span>
+              <strong id="resourcePairs" class="readout-value">—</strong>
+              <span class="readout-note">CRD kinds with collection paths</span>
+            </article>
+            <article class="readout">
+              <span class="readout-label">Metric series</span>
+              <strong id="metricSeries" class="readout-value">—</strong>
+              <span id="metricSeriesNote" class="readout-note">in the last Rush payload</span>
+            </article>
+            <article class="readout">
+              <span class="readout-label">Scrape targets</span>
+              <strong id="scrapeTargets" class="readout-value">—</strong>
+              <span id="scrapeTargetsNote" class="readout-note">waiting for discovery</span>
+            </article>
+            <article class="readout">
+              <span class="readout-label">Samples last cycle</span>
+              <strong id="scrapeSamples" class="readout-value">—</strong>
+              <span class="readout-note">workload samples collected</span>
+            </article>
+            <article class="readout">
+              <span class="readout-label">Uptime</span>
+              <strong id="uptime" class="readout-value">—</strong>
+              <span id="agentVersion" class="readout-note">version —</span>
+            </article>
+          </div>
+        </section>
+
+        <div class="workspace-grid">
+          <section class="panel collection-panel" aria-labelledby="collectionTitle">
+            <div class="panel-heading">
+              <div>
+                <p class="eyebrow">COLLECTION SURFACE</p>
+                <h2 id="collectionTitle">CRDs being watched</h2>
+              </div>
+              <span id="collectionCount" class="panel-count">—</span>
+            </div>
+            <p id="collectionSummary" class="panel-description">Click a resource pair to inspect the namespaces and object names currently observed.</p>
+            <div class="table-wrap">
+              <table class="data-table">
+                <caption class="sr-only">Custom resource definitions and their watch status</caption>
+                <thead>
+                  <tr>
+                    <th scope="col">CRD pair</th>
+                    <th scope="col">Prometheus</th>
+                    <th scope="col">Victoria</th>
+                    <th scope="col" class="numeric">Native</th>
+                    <th scope="col" class="numeric">Converted</th>
+                  </tr>
+                </thead>
+                <tbody id="pairRows">
+                  <tr class="table-state-row">
+                    <td colspan="5">Waiting for collection data…</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div id="pairEmpty" class="empty-state" hidden>
+              <strong>No CRD pairs reported</strong>
+              <span>The agent is healthy, but its watch set is empty or has not been discovered yet.</span>
+            </div>
+          </section>
+
+          <aside class="side-rail" aria-label="Agent runtime telemetry">
+            <section class="panel runtime-panel" aria-labelledby="runtimeTitle">
+              <div class="panel-heading compact-heading">
+                <div>
+                  <p class="eyebrow">PROCESS TELEMETRY</p>
+                  <h2 id="runtimeTitle">Runtime load</h2>
+                </div>
+                <span class="live-marker"><span aria-hidden="true"></span>live</span>
+              </div>
+              <div class="meter-list">
+                <div class="meter-row">
+                  <div class="meter-meta"><span>CPU</span><strong id="cpuValue">—</strong></div>
+                  <div class="meter-track" role="progressbar" aria-label="CPU utilization" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="cpuMeter"></span></div>
+                </div>
+                <div class="meter-row meter-row-memory">
+                  <div class="meter-meta"><span>Memory</span><strong id="memoryValue">—</strong></div>
+                </div>
+              </div>
+              <p class="runtime-note">Process measurements are sampled from the running agent.</p>
+            </section>
+
+            <section class="panel counters-panel" aria-labelledby="countersTitle">
+              <div class="panel-heading compact-heading">
+                <div>
+                  <p class="eyebrow">LIFETIME COUNTERS</p>
+                  <h2 id="countersTitle">Agent activity</h2>
+                </div>
+              </div>
+              <dl class="counter-list">
+                <div><dt>Reconciliations</dt><dd id="reconciliations">—</dd></div>
+                <div><dt>Victoria patches</dt><dd id="patchesVictoria">—</dd></div>
+                <div><dt>Prometheus patches</dt><dd id="patchesPrometheus">—</dd></div>
+                <div><dt>Errors</dt><dd id="errors" class="counter-value-errors">—</dd></div>
+              </dl>
+            </section>
+          </aside>
+        </div>
+
+        <section class="panel memory-panel" aria-labelledby="memoryTitle">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">RUNTIME FOOTPRINT</p>
+              <h2 id="memoryTitle">Top CRD memory consumers</h2>
+            </div>
+            <span id="memoryCount" class="panel-count">top 15</span>
+          </div>
+          <p class="panel-description">Estimated serialized watch-cache size by object, ranked across Prometheus and Victoria sources.</p>
+          <div id="memoryList" class="memory-list" aria-live="polite">
+            <div class="memory-empty">Waiting for collection data…</div>
+          </div>
+        </section>
+
+        <div class="lower-grid">
+          <section class="panel signals-panel" aria-labelledby="signalsTitle">
+            <div class="panel-heading compact-heading">
+              <div>
+                <p class="eyebrow">OBSERVABILITY OUTPUT</p>
+                <h2 id="signalsTitle">Example metric signals</h2>
+              </div>
+              <span id="seriesSource" class="source-label">agent health · /metrics</span>
+            </div>
+            <div id="signalsEmpty" class="signals-empty">
+              <strong>No metric text received yet</strong>
+              <span>Agent health metric names appear here. Scraped workload samples are delivered to Rush and are not duplicated on the local health endpoint.</span>
+            </div>
+            <div id="signalList" class="signal-list" aria-live="polite" hidden></div>
+          </section>
+
+          <section class="panel health-panel" aria-labelledby="healthTitle">
+            <div class="panel-heading compact-heading">
+              <div>
+                <p class="eyebrow">HEALTH GATES</p>
+                <h2 id="healthTitle">Endpoint health</h2>
+              </div>
+            </div>
+            <div class="health-list">
+              <div class="health-row"><span class="health-name"><span id="liveDot" class="health-dot" aria-hidden="true"></span>/livez</span><strong id="liveHealth">checking</strong></div>
+              <div class="health-row"><span class="health-name"><span id="readyDot" class="health-dot" aria-hidden="true"></span>/readyz</span><strong id="readyHealth">checking</strong></div>
+              <div class="health-row"><span class="health-name"><span id="metricsDot" class="health-dot" aria-hidden="true"></span>/metrics</span><strong id="metricsHealth">checking</strong></div>
+              <div class="health-row"><span class="health-name"><span id="remoteWriteDot" class="health-dot" aria-hidden="true"></span>Rush write</span><strong id="remoteWriteHealth">not configured</strong></div>
+            </div>
+            <p class="health-note">Readiness reflects the agent’s ability to collect and publish, not just process liveness.</p>
+          </section>
+        </div>
+      </main>
+
+      <div id="metricDrawer" class="metric-drawer" hidden aria-hidden="true">
+        <button id="metricDrawerBackdrop" class="metric-drawer-backdrop" type="button" aria-label="Close metric details"></button>
+        <aside class="metric-drawer-panel" aria-labelledby="metricDrawerTitle">
+          <div class="metric-drawer-header">
+            <div>
+              <p class="eyebrow">CRD CARDINALITY</p>
+              <h2 id="metricDrawerTitle">Metric details</h2>
+              <span id="metricDrawerSubtitle" class="metric-detail-subtitle"></span>
+            </div>
+            <button id="metricDrawerClose" class="button button-small" type="button">Close</button>
+          </div>
+          <div class="metric-drawer-stats">
+            <div><span>Memory estimate</span><strong id="drawerMemory">—</strong></div>
+            <div><span>Total series</span><strong id="drawerSeries">—</strong></div>
+            <div><span>Samples</span><strong id="drawerSamples">—</strong></div>
+          </div>
+          <div class="metric-drawer-section">
+            <div class="metric-drawer-section-heading">
+              <span class="eyebrow">TOP 15</span>
+              <span id="drawerMetricCount" class="panel-count"></span>
+            </div>
+            <div id="metricDrawerList" class="metric-detail-list"></div>
+          </div>
+        </aside>
+      </div>
+
+      <footer class="page-footer">
+        <span>Metrics agent control surface</span>
+        <span>Auto-refresh <strong>5s</strong></span>
+      </footer>
+    </div>
+  </body>
+</html>

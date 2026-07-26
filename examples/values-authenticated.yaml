@@ -1,0 +1,22 @@
+remoteWrite:
+  - url: https://prometheus.example.com/api/v1/write
+    basicAuth:
+      username:
+        name: remote-write-credentials
+        key: username
+      password:
+        name: remote-write-credentials
+        key: password
+    tlsConfig:
+      ca:
+        secret:
+          name: remote-write-ca
+          key: ca.crt
+
+vmagent:
+  externalLabels:
+    cluster: production-us-west-2
+  enforcedNamespaceLabel: source_namespace
+  remoteWriteSettings:
+    flushInterval: 1s
+    maxDiskUsagePerURL: 10GiB

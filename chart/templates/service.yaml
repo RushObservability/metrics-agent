@@ -1,0 +1,22 @@
+{{- if .Values.precedence.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "metrics-agent.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "metrics-agent.labels" . | nindent 4 }}
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - name: http
+      port: {{ include "metrics-agent.httpPort" . }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "metrics-agent.selectorLabels" . | nindent 4 }}
+{{- end }}

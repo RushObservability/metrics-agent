@@ -1,0 +1,8 @@
+# Enable the embedded metrics-agent UI on the existing HTTP Service.
+ui:
+  enabled: true
+  path: /ui/
+  # Empty inherits service.port (7070 by default).
+  port: ""
+
+# Direct Rush publishing is configured separately in values-rush.yaml.
