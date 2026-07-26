@@ -1,0 +1,50 @@
+{{- if .Values.vmagent.enabled }}
+{{- if not .Values.remoteWrite }}
+{{- fail "remoteWrite must contain at least one Prometheus remote_write-compatible endpoint" }}
+{{- end }}
+{{- range $index, $remote := .Values.remoteWrite }}
+{{- if not $remote.url }}
+{{- fail (printf "remoteWrite[%d].url is required" $index) }}
+{{- end }}
+{{- end }}
+{{- $extraArgs := deepCopy .Values.vmagent.extraArgs }}
+{{- if .Values.metricsSeriesTracking.enabled }}
+{{- $_ := set $extraArgs "remoteWrite.maxHourlySeries" "-1" }}
+{{- $_ := set $extraArgs "remoteWrite.maxDailySeries" "-1" }}
+{{- end }}
+{{- $generated := dict
+  "selectAllByDefault" .Values.vmagent.selectAllByDefault
+  "remoteWrite" .Values.remoteWrite
+  "replicaCount" (.Values.vmagent.replicaCount | int)
+  "scrapeInterval" .Values.vmagent.scrapeInterval
+  "scrapeTimeout" .Values.vmagent.scrapeTimeout
+  "logLevel" .Values.vmagent.logLevel
+  "logFormat" .Values.vmagent.logFormat
+  "useStrictSecurity" .Values.vmagent.useStrictSecurity
+  "resources" .Values.vmagent.resources
+  "remoteWriteSettings" .Values.vmagent.remoteWriteSettings
+  "extraArgs" $extraArgs
+-}}
+{{- if .Values.vmagent.serviceAccountName }}
+{{- $_ := set $generated "serviceAccountName" .Values.vmagent.serviceAccountName }}
+{{- end }}
+{{- if .Values.vmagent.enforcedNamespaceLabel }}
+{{- $_ := set $generated "enforcedNamespaceLabel" .Values.vmagent.enforcedNamespaceLabel }}
+{{- end }}
+{{- if .Values.vmagent.ignoreNamespaceSelectors }}
+{{- $_ := set $generated "ignoreNamespaceSelectors" true }}
+{{- end }}
+{{- if .Values.vmagent.externalLabels }}
+{{- $_ := set $generated "externalLabels" .Values.vmagent.externalLabels }}
+{{- end }}
+{{- $spec := mergeOverwrite $generated (deepCopy .Values.vmagent.spec) }}
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMAgent
+metadata:
+  name: {{ include "metrics-agent.vmagentName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "metrics-agent.labels" . | nindent 4 }}
+spec:
+  {{- toYaml $spec | nindent 2 }}
+{{- end }}

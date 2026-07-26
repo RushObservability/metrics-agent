@@ -1,0 +1,175 @@
+image:
+  repository: ghcr.io/rushobservability/metrics-agent
+  pullPolicy: IfNotPresent
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+replicaCount: 1
+
+controller:
+  logLevel: info
+  workers: 2
+  resyncPeriod: 5m
+
+scrape:
+  enabled: true
+  interval: 15s
+  timeout: 10s
+
+serviceAccount:
+  create: true
+  automountServiceAccountToken: true
+  annotations: {}
+  name: ""
+
+rbac:
+  create: true
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+resources:
+  requests:
+    cpu: 20m
+    memory: 48Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+topologySpreadConstraints: []
+
+service:
+  type: ClusterIP
+  port: 7070
+  annotations: {}
+
+ui:
+  # The embedded UI is enabled by default and is served through the existing
+  # metrics-agent HTTP Service.
+  enabled: true
+  path: /ui/
+  # Empty uses service.port. Set this only when the UI/server should listen on
+  # a different port; the chart will expose that port through the Service.
+  port: ""
+  # Empty binds the UI to all interfaces on the selected HTTP port.
+  address: ""
+
+status:
+  livenessPath: /livez
+  readinessPath: /readyz
+  metricsPath: /metrics
+
+# Optional Prometheus Operator scrape of the agent's /metrics endpoint for
+# clusters that already run a separate Prometheus. This is not required for
+# Rush publishing; use rushRemoteWrite for direct delivery to Rush.
+selfMetrics:
+  enabled: false
+
+# vmagent's cardinality counters are approximate. When enabled, -1 turns on
+# hourly/daily series tracking without imposing a practical series cap.
+metricsSeriesTracking:
+  enabled: false
+
+# Additional non-secret environment variables for the metrics-agent container.
+env: []
+
+serviceMonitor:
+  enabled: false
+  annotations: {}
+  labels: {}
+  interval: 30s
+
+# Optional VMAgent configuration for installations that want VictoriaMetrics
+# to scrape workload CRDs. The Rust agent's own Rush publishing does not use
+# VMAgent.
+remoteWrite: []
+#  - url: https://prometheus.example.com/api/v1/write
+#    basicAuth:
+#      username:
+#        name: remote-write-credentials
+#        key: username
+#      password:
+#        name: remote-write-credentials
+#        key: password
+#    tlsConfig:
+#      ca:
+#        secret:
+#          name: remote-write-ca
+#          key: ca.crt
+
+vmagent:
+  enabled: false
+  name: ""
+  replicaCount: 1
+  scrapeInterval: 30s
+  scrapeTimeout: 10s
+  selectAllByDefault: true
+  logLevel: INFO
+  logFormat: json
+  useStrictSecurity: true
+  serviceAccountName: ""
+  # Base URL for the operator-created vmagent HTTP API. Empty lets the chart
+  # provide the in-cluster URL to the optional metrics-agent UI.
+  metricsURL: ""
+  enforcedNamespaceLabel: ""
+  ignoreNamespaceSelectors: false
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  remoteWriteSettings:
+    flushInterval: 1s
+    maxDiskUsagePerURL: 1GiB
+  externalLabels: {}
+  extraArgs: {}
+  # Arbitrary additional fields merged into the VMAgent spec. Values here take
+  # precedence over the chart's generated defaults.
+  spec: {}
+
+rushRemoteWrite:
+  # The Rust agent publishes its own /metrics payload directly to this URL.
+  enabled: false
+  url: ""
+  interval: 15s
+  # Optional tenant name/id. This becomes X-Rush-Tenant. A bearer token takes
+  # precedence in query-api and must already belong to the requested tenant.
+  tenant: ""
+  bearerTokenSecret:
+    name: ""
+    key: token
+
+# The VictoriaMetrics Operator's Prometheus converter must be enabled with
+# VM_ENABLEDPROMETHEUSCONVERTEROWNERREFERENCES=true. See README.md.
+precedence:
+  enabled: true
+
+networkPolicy:
+  enabled: false
+  # Add ingress/egress rules appropriate for the cluster when enabled. An empty
+  # list is intentionally deny-all under Kubernetes NetworkPolicy semantics.
+  ingress: []
+  egress: []

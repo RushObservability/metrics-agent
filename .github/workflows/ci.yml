@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches:
+      - '**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify metrics-agent
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Rust tests
+        run: cargo test --all-targets --all-features
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Check embedded UI JavaScript
+        run: node --check ui/app.js
+
+      - name: Lint Helm chart
+        run: helm lint chart --set rushRemoteWrite.enabled=true --set 'rushRemoteWrite.url=http://localhost:8080/prom/api/v1/write'
+
+      - name: Render Helm chart
+        run: helm template metrics-agent chart --namespace monitoring --set rushRemoteWrite.enabled=true --set 'rushRemoteWrite.url=http://localhost:8080/prom/api/v1/write' >/dev/null
+
+      - name: Validate workflow YAML
+        run: |
+          ruby -e 'require "yaml"; Dir[".github/workflows/*.yml"].each { |path| YAML.load_file(path); puts "valid YAML: #{path}" }'

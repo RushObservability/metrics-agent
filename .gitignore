@@ -1,0 +1,5 @@
+/bin/
+/metrics-agent
+/target/
+/graphify-out/
+*.out

@@ -1,0 +1,7 @@
+remoteWrite:
+  - url: https://prometheus.example.com/api/v1/write
+
+vmagent:
+  externalLabels:
+    cluster: production-us-west-2
+    collector: metrics-agent
