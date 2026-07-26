@@ -1,4 +1,7 @@
 {{- if .Values.precedence.enabled }}
+{{- if ne (.Values.replicaCount | int) 1 }}
+{{- fail "replicaCount must be exactly 1 until metrics-agent supports leader election" }}
+{{- end }}
 {{- if and .Values.rushRemoteWrite.enabled (not .Values.rushRemoteWrite.url) }}
 {{- fail "rushRemoteWrite.url is required when rushRemoteWrite.enabled=true" }}
 {{- end }}
@@ -28,6 +31,12 @@ spec:
     spec:
       serviceAccountName: {{ include "metrics-agent.serviceAccountName" . }}
       automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      enableServiceLinks: {{ .Values.enableServiceLinks }}
+      hostNetwork: {{ .Values.hostNetwork }}
+      hostPID: {{ .Values.hostPID }}
+      hostIPC: {{ .Values.hostIPC }}
+      shareProcessNamespace: {{ .Values.shareProcessNamespace }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       {{- with .Values.imagePullSecrets }}
@@ -87,6 +96,13 @@ spec:
             httpGet:
               path: {{ .Values.status.readinessPath | quote }}
               port: http
+          startupProbe:
+            httpGet:
+              path: {{ .Values.status.readinessPath | quote }}
+              port: http
+            failureThreshold: 30
+            periodSeconds: 2
+            timeoutSeconds: 2
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           resources:
