@@ -1,5 +1,5 @@
 .git
 .github
 bin
-chart/tests
+helm-chart/tests
 README.md

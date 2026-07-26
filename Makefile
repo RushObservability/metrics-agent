@@ -28,10 +28,10 @@ check: fmt test
 	cargo check
 
 helm-lint:
-	helm lint chart --set rushRemoteWrite.enabled=true --set 'rushRemoteWrite.url=$(RUSH_REMOTE_WRITE_URL)'
+	helm lint helm-chart --set rushRemoteWrite.enabled=true --set 'rushRemoteWrite.url=$(RUSH_REMOTE_WRITE_URL)'
 
 helm-template:
-	helm template metrics-agent chart --namespace monitoring --set rushRemoteWrite.enabled=true --set 'rushRemoteWrite.url=$(RUSH_REMOTE_WRITE_URL)' >/dev/null
+	helm template metrics-agent helm-chart --namespace monitoring --set rushRemoteWrite.enabled=true --set 'rushRemoteWrite.url=$(RUSH_REMOTE_WRITE_URL)' >/dev/null
 
 verify: fmt test helm-lint helm-template
 	cargo check
