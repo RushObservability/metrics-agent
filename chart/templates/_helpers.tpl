@@ -39,10 +39,6 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 {{- end }}
 
-{{- define "metrics-agent.vmagentName" -}}
-{{- default (include "metrics-agent.fullname" .) .Values.vmagent.name | trunc 63 | trimSuffix "-" }}
-{{- end }}
-
 {{- define "metrics-agent.image" -}}
 {{- if .Values.image.digest -}}
 {{- printf "%s@%s" .Values.image.repository .Values.image.digest }}

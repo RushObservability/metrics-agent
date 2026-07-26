@@ -107,11 +107,6 @@ status:
 selfMetrics:
   enabled: false
 
-# vmagent's cardinality counters are approximate. When enabled, -1 turns on
-# hourly/daily series tracking without imposing a practical series cap.
-metricsSeriesTracking:
-  enabled: false
-
 # Additional non-secret environment variables for the metrics-agent container.
 env: []
 
@@ -120,56 +115,6 @@ serviceMonitor:
   annotations: {}
   labels: {}
   interval: 30s
-
-# Optional VMAgent configuration for installations that want VictoriaMetrics
-# to scrape workload CRDs. The Rust agent's own Rush publishing does not use
-# VMAgent.
-remoteWrite: []
-#  - url: https://prometheus.example.com/api/v1/write
-#    basicAuth:
-#      username:
-#        name: remote-write-credentials
-#        key: username
-#      password:
-#        name: remote-write-credentials
-#        key: password
-#    tlsConfig:
-#      ca:
-#        secret:
-#          name: remote-write-ca
-#          key: ca.crt
-
-vmagent:
-  enabled: false
-  name: ""
-  replicaCount: 1
-  scrapeInterval: 30s
-  scrapeTimeout: 10s
-  selectAllByDefault: true
-  logLevel: INFO
-  logFormat: json
-  useStrictSecurity: true
-  serviceAccountName: ""
-  # Base URL for the operator-created vmagent HTTP API. Empty lets the chart
-  # provide the in-cluster URL to the optional metrics-agent UI.
-  metricsURL: ""
-  enforcedNamespaceLabel: ""
-  ignoreNamespaceSelectors: false
-  resources:
-    requests:
-      cpu: 100m
-      memory: 256Mi
-    limits:
-      cpu: "1"
-      memory: 1Gi
-  remoteWriteSettings:
-    flushInterval: 1s
-    maxDiskUsagePerURL: 1GiB
-  externalLabels: {}
-  extraArgs: {}
-  # Arbitrary additional fields merged into the VMAgent spec. Values here take
-  # precedence over the chart's generated defaults.
-  spec: {}
 
 rushRemoteWrite:
   # The Rust agent publishes its own /metrics payload directly to this URL.

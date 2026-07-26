@@ -3,21 +3,6 @@ metrics-agent has been installed.
 The Rust agent watches supported scrape CRDs through the Kubernetes API and can
 publish its own health metrics directly to Rush.
 
-{{- if .Values.vmagent.enabled }}
-The chart also created VMAgent {{ include "metrics-agent.vmagentName" . }} and configured it to select scrape CRDs cluster-wide.
-
-Required VictoriaMetrics Operator setting:
-  operator:
-    disable_prometheus_converter: false
-    enable_converter_ownership: true
-
-Confirm the VMAgent is ready:
-  kubectl -n {{ .Release.Namespace }} get vmagent {{ include "metrics-agent.vmagentName" . }}
-
-Inspect discovered targets through the operator-created vmagent service:
-  kubectl -n {{ .Release.Namespace }} port-forward svc/vmagent-{{ include "metrics-agent.vmagentName" . }} 8429:8429
-  open http://localhost:8429/targets
-{{- end }}
 {{- if .Values.rushRemoteWrite.enabled }}
 
 Direct Rush remote write is enabled at:

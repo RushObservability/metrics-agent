@@ -94,7 +94,7 @@ pub struct PublishResult {
 
 /// Converts the agent's own Prometheus exposition into Rush's remote-write
 /// protobuf and sends it directly to the query API. This keeps self-metrics
-/// independent of vmagent or a ServiceMonitor.
+/// independent of an external scrape agent or a ServiceMonitor.
 pub async fn publish(
     client: &reqwest::Client,
     url: &str,

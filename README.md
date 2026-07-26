@@ -18,14 +18,14 @@ It also includes a small control surface for collection health, process resource
 usage, discovered CRDs, scrape status, and per-CRD metric cardinality.
 
 > metrics-agent is normally deployed as part of a [Rush](https://github.com/RushObservability)
-> installation. It does not require VMAgent to publish workload metrics to Rush.
+> installation. It publishes workload metrics directly to Rush.
 
 ## Why use metrics-agent?
 
 Use metrics-agent when you want to discover and collect the scrape configuration
-already present in a Kubernetes cluster without installing a separate datasource
-or relying on VMAgent to scrape it. It understands Prometheus Operator and
-VictoriaMetrics Operator CRDs, resolves their targets, and sends the resulting
+already present in a Kubernetes cluster without installing a separate datasource.
+It understands Prometheus Operator and VictoriaMetrics Operator CRDs, resolves
+their targets, and sends the resulting
 metrics directly to Rush.
 
 This is useful when you want to:
@@ -84,9 +84,8 @@ batches. It does not retain an entire scrape cycle before publishing it.
 | Probe | VMProbe |
 | ScrapeConfig | VMScrapeConfig |
 
-Native VMNodeScrape and VMStaticScrape resources are also selected by the
-optional VMAgent integration. Rule and Alertmanager resources are excluded
-because they do not define scrape targets.
+Rule and Alertmanager resources are excluded because they do not define scrape
+targets.
 
 ## Precedence
 
@@ -114,8 +113,8 @@ with the Prometheus resource.
 
 - Kubernetes 1.27 or newer
 - Helm 3
-- VictoriaMetrics Operator installed cluster-wide
 - Prometheus Operator CRDs when Prometheus scrape resources are used
+- VictoriaMetrics Operator CRDs when VictoriaMetrics scrape resources are used
 
 Configure the VictoriaMetrics converter with owner references enabled:
 
@@ -191,8 +190,6 @@ DNS, scrape-target, and Rush/query-api destinations for your cluster.
 
 The chart deploys exactly one metrics-agent replica. Values other than
 replicaCount: 1 are rejected until the controller supports leader election.
-The optional VMAgent integration is disabled by default; enabling it creates a
-separate VMAgent workload.
 
 ## Configuration
 
@@ -219,8 +216,8 @@ settings are:
 | METRICS_AGENT_VERSION | dev | Version shown in status and UI |
 
 The Helm chart exposes these through chart/values.yaml, including UI, security
-context, resources, ServiceMonitor, NetworkPolicy, optional VMAgent, and direct
-Rush remote-write settings.
+context, resources, ServiceMonitor, NetworkPolicy, and direct Rush remote-write
+settings.
 
 ## Embedded control surface
 

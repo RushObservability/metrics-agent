@@ -10,6 +10,5 @@ rushRemoteWrite:
     name: rush-remote-write
     key: token
 
-# vmagent remains disabled by default. The Rust agent discovers scrape targets
-# from the CRDs, scrapes them, and sends workload plus health metrics directly
-# to Rush.
+# The Rust agent discovers scrape targets from the CRDs, scrapes them, and sends
+# workload plus health metrics directly to Rush.
