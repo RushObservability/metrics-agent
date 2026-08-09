@@ -63,6 +63,9 @@ spec:
             - name: METRICS_AGENT_UI_PATH
               value: {{ .Values.ui.path | quote }}
             {{- if .Values.rushRemoteWrite.enabled }}
+            {{- if and (not .Values.rushRemoteWrite.bearerTokenSecret.name) (not .Values.rushRemoteWrite.allowAnonymous) }}
+            {{- fail "rushRemoteWrite.bearerTokenSecret.name is required when Rush remote write is enabled" }}
+            {{- end }}
             - name: RUSH_REMOTE_WRITE_URL
               value: {{ .Values.rushRemoteWrite.url | quote }}
             - name: RUSH_REMOTE_WRITE_INTERVAL

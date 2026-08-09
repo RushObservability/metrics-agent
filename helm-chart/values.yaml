@@ -121,10 +121,15 @@ rushRemoteWrite:
   enabled: false
   url: ""
   interval: 15s
-  # Optional tenant name/id. This becomes X-Rush-Tenant. A bearer token takes
-  # precedence in query-api and must already belong to the requested tenant.
+  # Set true only when the target Rush tenant explicitly has "Require ingest
+  # key" disabled. Otherwise bearerTokenSecret.name is required.
+  allowAnonymous: false
+  # Optional tenant name/id routing hint. It never authorizes access; the
+  # ingest-only bearer key must already belong to this tenant.
   tenant: ""
   bearerTokenSecret:
+    # Required when enabled. The key must be a Rush ingest-only API key with
+    # the metrics signal enabled, not a query/user or legacy key.
     name: ""
     key: token
 
