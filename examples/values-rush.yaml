@@ -1,10 +1,11 @@
 # Create this Secret before installing the chart:
 # kubectl -n monitoring create secret generic rush-remote-write \
-#   --from-literal=token='your_64_character_tenant_api_key'
+#   --from-literal=token='rush_ing_...'
 rushRemoteWrite:
   enabled: true
+  allowAnonymous: false
   url: http://rush-query-api.monitoring.svc.cluster.local:8080/prom/api/v1/write
-  # Optional for open tenants; locked tenants should use a tenant-scoped token.
+  # Optional routing hint; the metrics-scoped ingest key remains authoritative.
   tenant: ""
   bearerTokenSecret:
     name: rush-remote-write

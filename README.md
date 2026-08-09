@@ -171,8 +171,9 @@ Build and publish the image, or use a release image from GHCR:
       --set rushRemoteWrite.enabled=true \
       --set rushRemoteWrite.url=http://rush-query-api.monitoring.svc.cluster.local:8080/prom/api/v1/write
 
-For Rush authentication, see examples/values-rush.yaml. Keep the bearer token
-in a Kubernetes Secret rather than in Helm values:
+For secured Rush ingestion, create an **ingest-only** API key scoped to the
+target tenant and the `metrics` signal. Keep that bearer token in a Kubernetes
+Secret rather than in Helm values:
 
     kubectl -n monitoring create secret generic rush-remote-write \
       --from-literal=token=your_tenant_scoped_api_key
@@ -183,6 +184,10 @@ in a Kubernetes Secret rather than in Helm values:
       bearerTokenSecret:
         name: rush-remote-write
         key: token
+
+For a tenant whose **Require ingest key** setting is off, omit the Secret and
+set `rushRemoteWrite.allowAnonymous: true`. Anonymous remote write is otherwise
+rejected by the chart and by Rush.
 
 The final image uses a Chainguard Rust builder and glibc-dynamic runtime. It
 runs as UID 65532, has no shell or package manager, and uses a read-only
@@ -213,8 +218,8 @@ settings are:
 | METRICS_AGENT_UI_PATH | /ui/ | UI mount path |
 | RUSH_REMOTE_WRITE_URL | unset | Rush remote-write endpoint |
 | RUSH_REMOTE_WRITE_INTERVAL | 15s | Self-metrics heartbeat interval |
-| RUSH_REMOTE_WRITE_TOKEN | unset | Optional tenant bearer token |
-| RUSH_REMOTE_WRITE_TENANT | unset | Optional X-Rush-Tenant value |
+| RUSH_REMOTE_WRITE_TOKEN | unset | Ingest-only key scoped to `metrics`; omit only for explicitly open ingestion |
+| RUSH_REMOTE_WRITE_TENANT | unset | Optional routing hint; never grants access without a matching key |
 | METRICS_AGENT_SCRAPE_ENABLED | true | Enable discovered-target scraping |
 | METRICS_AGENT_SCRAPE_INTERVAL | 15s | Scrape cycle interval |
 | METRICS_AGENT_SCRAPE_TIMEOUT | 10s | Per-target HTTP timeout |
