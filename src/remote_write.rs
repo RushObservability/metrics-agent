@@ -102,20 +102,43 @@ pub async fn publish(
     tenant: Option<&str>,
     snapshot: &StatusSnapshot,
     scraped: &[CollectedMetric],
+    extra_labels: &BTreeMap<String, String>,
 ) -> Result<PublishResult> {
-    publish_inner(client, url, token, tenant, snapshot, scraped, true).await
+    publish_inner(
+        client,
+        url,
+        snapshot,
+        scraped,
+        PublishOptions {
+            token,
+            tenant,
+            extra_labels,
+            include_self: true,
+        },
+    )
+    .await
+}
+
+struct PublishOptions<'a> {
+    token: Option<&'a str>,
+    tenant: Option<&'a str>,
+    extra_labels: &'a BTreeMap<String, String>,
+    include_self: bool,
 }
 
 async fn publish_inner(
     client: &reqwest::Client,
     url: &str,
-    token: Option<&str>,
-    tenant: Option<&str>,
     snapshot: &StatusSnapshot,
     scraped: &[CollectedMetric],
-    include_self: bool,
+    options: PublishOptions<'_>,
 ) -> Result<PublishResult> {
-    let payload = encode(snapshot, scraped, include_self)?;
+    let payload = encode(
+        snapshot,
+        scraped,
+        options.extra_labels,
+        options.include_self,
+    )?;
     let compressed = snap::raw::Encoder::new()
         .compress_vec(&payload.bytes)
         .context("compress remote-write payload")?;
@@ -126,10 +149,10 @@ async fn publish_inner(
         .header(CONTENT_ENCODING, "snappy")
         .header("X-Prometheus-Remote-Write-Version", "0.1.0")
         .body(compressed);
-    if let Some(token) = token.filter(|token| !token.is_empty()) {
+    if let Some(token) = options.token.filter(|token| !token.is_empty()) {
         request = request.bearer_auth(token);
     }
-    if let Some(tenant) = tenant.filter(|tenant| !tenant.is_empty()) {
+    if let Some(tenant) = options.tenant.filter(|tenant| !tenant.is_empty()) {
         request = request.header("X-Rush-Tenant", tenant);
     }
     let response = request.send().await.context("send remote-write payload")?;
@@ -157,6 +180,7 @@ struct EncodedPayload {
 fn encode(
     snapshot: &StatusSnapshot,
     scraped: &[CollectedMetric],
+    extra_labels: &BTreeMap<String, String>,
     include_self: bool,
 ) -> Result<EncodedPayload> {
     let exposition = metrics::render(snapshot);
@@ -210,6 +234,7 @@ fn encode(
                     value: "metrics-agent".to_string(),
                 });
             }
+            merge_extra_labels(&mut labels, extra_labels);
             labels.sort_by(|left, right| left.name.cmp(&right.name));
             series.push((
                 name.to_string(),
@@ -237,6 +262,7 @@ fn encode(
             name: "__name__".to_string(),
             value: metric.name.clone(),
         });
+        merge_extra_labels(&mut labels, extra_labels);
         labels.sort_by(|left, right| left.name.cmp(&right.name));
         helps.insert(metric.name.clone(), metric.help.clone());
         types.insert(metric.name.clone(), metric.metric_type as i32);
@@ -275,6 +301,22 @@ fn encode(
         series: request.timeseries.len() as u64,
         samples,
     })
+}
+
+/// Apply deployment-wide labels to every outgoing series. Configured values
+/// intentionally replace same-named target/exporter labels so a declaration
+/// such as `env=dev` has one consistent value across the entire payload.
+fn merge_extra_labels(labels: &mut Vec<Label>, extra_labels: &BTreeMap<String, String>) {
+    for (name, value) in extra_labels {
+        if let Some(existing) = labels.iter_mut().find(|label| label.name == *name) {
+            existing.value.clone_from(value);
+        } else {
+            labels.push(Label {
+                name: name.clone(),
+                value: value.clone(),
+            });
+        }
+    }
 }
 
 fn metric_type(kind: &str) -> i32 {
@@ -439,6 +481,7 @@ pub async fn run(
     url: Option<String>,
     token: Option<String>,
     tenant: Option<String>,
+    extra_labels: BTreeMap<String, String>,
     interval: std::time::Duration,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
@@ -468,11 +511,14 @@ pub async fn run(
                         match publish_inner(
                             &client,
                             url,
-                            token.as_deref(),
-                            tenant.as_deref(),
                             &snapshot,
                             &metrics,
-                            !cycle_sent_self,
+                            PublishOptions {
+                                token: token.as_deref(),
+                                tenant: tenant.as_deref(),
+                                extra_labels: &extra_labels,
+                                include_self: !cycle_sent_self,
+                            },
                         ).await {
                             Ok(result) => {
                                 cycle_sent_self = true;
@@ -490,7 +536,18 @@ pub async fn run(
                             // agent's own health metrics.
                             if cycle_active && !cycle_sent_self && cycle_error.is_none() {
                                 let snapshot = status.snapshot().await;
-                                match publish_inner(&client, url, token.as_deref(), tenant.as_deref(), &snapshot, &[], true).await {
+                                match publish_inner(
+                                    &client,
+                                    url,
+                                    &snapshot,
+                                    &[],
+                                    PublishOptions {
+                                        token: token.as_deref(),
+                                        tenant: tenant.as_deref(),
+                                        extra_labels: &extra_labels,
+                                        include_self: true,
+                                    },
+                                ).await {
                                     Ok(result) => {
                                         cycle_sent_self = true;
                                         cycle_series += result.series;
@@ -522,7 +579,18 @@ pub async fn run(
                             continue;
                         }
                         let timestamp = humantime::format_rfc3339_seconds(SystemTime::now()).to_string();
-                        match publish_inner(&client, url, token.as_deref(), tenant.as_deref(), &snapshot, &[], true).await {
+                        match publish_inner(
+                            &client,
+                            url,
+                            &snapshot,
+                            &[],
+                            PublishOptions {
+                                token: token.as_deref(),
+                                tenant: tenant.as_deref(),
+                                extra_labels: &extra_labels,
+                                include_self: true,
+                            },
+                        ).await {
                             Ok(result) => status.set_remote_write_result(Some(result.series), Some(result.samples), timestamp, None).await,
                             Err(error) => status.set_remote_write_result(None, None, timestamp, Some(error.to_string())).await,
                         }
@@ -535,6 +603,8 @@ pub async fn run(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use prost::Message;
 
     use super::{
@@ -674,7 +744,7 @@ request_total{job="scrape",path="a\\b\"c\n",code="200"} 3.5 1700000000123
             help: "Total requests.".into(),
             metric_type: MetricType::Counter,
         };
-        let encoded = encode(&snapshot(), &[metric], false).unwrap();
+        let encoded = encode(&snapshot(), &[metric], &BTreeMap::new(), false).unwrap();
         assert_eq!(encoded.series, 1);
         assert_eq!(encoded.samples, 1);
 
@@ -710,7 +780,7 @@ request_total{job="scrape",path="a\\b\"c\n",code="200"} 3.5 1700000000123
             help: String::new(),
             metric_type: MetricType::Gauge,
         };
-        let encoded = encode(&snapshot(), &[metric], false).unwrap();
+        let encoded = encode(&snapshot(), &[metric], &BTreeMap::new(), false).unwrap();
         let compressed = snap::raw::Encoder::new()
             .compress_vec(&encoded.bytes)
             .unwrap();
@@ -724,7 +794,7 @@ request_total{job="scrape",path="a\\b\"c\n",code="200"} 3.5 1700000000123
 
     #[test]
     fn self_metrics_add_reserved_name_and_default_labels() {
-        let encoded = encode(&snapshot(), &[], true).unwrap();
+        let encoded = encode(&snapshot(), &[], &BTreeMap::new(), true).unwrap();
         let request = WriteRequest::decode(encoded.bytes.as_slice()).unwrap();
         let ready = request
             .timeseries
@@ -748,5 +818,39 @@ request_total{job="scrape",path="a\\b\"c\n",code="200"} 3.5 1700000000123
                 .iter()
                 .any(|label| { label.name == "service" && label.value == "metrics-agent" })
         );
+    }
+
+    #[test]
+    fn extra_labels_apply_to_every_series_and_override_existing_values() {
+        let metric = CollectedMetric {
+            name: "http_requests_total".into(),
+            labels: vec![("env".into(), "prod".into()), ("job".into(), "api".into())],
+            value: 1.0,
+            timestamp: 1700000000123,
+            help: String::new(),
+            metric_type: MetricType::Counter,
+        };
+        let extra_labels = BTreeMap::from([
+            ("cluster".to_string(), "ntt-japan".to_string()),
+            ("env".to_string(), "dev".to_string()),
+        ]);
+        let encoded = encode(&snapshot(), &[metric], &extra_labels, true).unwrap();
+        let request = WriteRequest::decode(encoded.bytes.as_slice()).unwrap();
+
+        assert!(!request.timeseries.is_empty());
+        for series in request.timeseries {
+            assert!(
+                series
+                    .labels
+                    .iter()
+                    .any(|label| label.name == "env" && label.value == "dev")
+            );
+            assert!(
+                series
+                    .labels
+                    .iter()
+                    .any(|label| label.name == "cluster" && label.value == "ntt-japan")
+            );
+        }
     }
 }

@@ -37,6 +37,11 @@ rbac:
 podAnnotations: {}
 podLabels: {}
 
+# Labels added to every Prometheus remote-write series. These values override
+# same-named labels supplied by a scrape target so the deployment label remains
+# consistent across workload and metrics-agent self-metrics.
+extraLabels: {}
+
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 65532

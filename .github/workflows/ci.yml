@@ -35,10 +35,10 @@ jobs:
         run: node --check ui/app.js
 
       - name: Lint Helm chart
-        run: helm lint helm-chart --set rushRemoteWrite.enabled=true --set 'rushRemoteWrite.url=http://localhost:8080/prom/api/v1/write'
+        run: helm lint helm-chart --set rushRemoteWrite.enabled=true --set rushRemoteWrite.allowAnonymous=true --set 'rushRemoteWrite.url=http://localhost:8080/prom/api/v1/write'
 
       - name: Render Helm chart
-        run: helm template metrics-agent helm-chart --namespace monitoring --set rushRemoteWrite.enabled=true --set 'rushRemoteWrite.url=http://localhost:8080/prom/api/v1/write' >/dev/null
+        run: helm template metrics-agent helm-chart --namespace monitoring --set rushRemoteWrite.enabled=true --set rushRemoteWrite.allowAnonymous=true --set 'rushRemoteWrite.url=http://localhost:8080/prom/api/v1/write' >/dev/null
 
       - name: Validate workflow YAML
         run: |
