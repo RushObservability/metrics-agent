@@ -62,6 +62,8 @@ spec:
               value: {{ default (printf "0.0.0.0:%s" (include "metrics-agent.httpPort" .)) .Values.ui.address | quote }}
             - name: METRICS_AGENT_UI_PATH
               value: {{ .Values.ui.path | quote }}
+            - name: METRICS_AGENT_EXTRA_LABELS
+              value: {{ .Values.extraLabels | toJson | quote }}
             {{- if .Values.rushRemoteWrite.enabled }}
             {{- if and (not .Values.rushRemoteWrite.bearerTokenSecret.name) (not .Values.rushRemoteWrite.allowAnonymous) }}
             {{- fail "rushRemoteWrite.bearerTokenSecret.name is required when Rush remote write is enabled" }}

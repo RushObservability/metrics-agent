@@ -189,6 +189,12 @@ For a tenant whose **Require ingest key** setting is off, omit the Secret and
 set `rushRemoteWrite.allowAnonymous: true`. Anonymous remote write is otherwise
 rejected by the chart and by Rush.
 
+Add deployment-wide labels to every outgoing series with top-level
+`extraLabels`. Configured values override same-named labels from scrape targets:
+
+    extraLabels:
+      env: dev
+
 The final image uses a Chainguard Rust builder and glibc-dynamic runtime. It
 runs as UID 65532, has no shell or package manager, and uses a read-only
 filesystem with Linux capabilities dropped.
@@ -220,6 +226,7 @@ settings are:
 | RUSH_REMOTE_WRITE_INTERVAL | 15s | Self-metrics heartbeat interval |
 | RUSH_REMOTE_WRITE_TOKEN | unset | Ingest-only key scoped to `metrics`; omit only for explicitly open ingestion |
 | RUSH_REMOTE_WRITE_TENANT | unset | Optional routing hint; never grants access without a matching key |
+| METRICS_AGENT_EXTRA_LABELS | `{}` | JSON map added to every remote-write series; configured values win on collision |
 | METRICS_AGENT_SCRAPE_ENABLED | true | Enable discovered-target scraping |
 | METRICS_AGENT_SCRAPE_INTERVAL | 15s | Scrape cycle interval |
 | METRICS_AGENT_SCRAPE_TIMEOUT | 10s | Per-target HTTP timeout |

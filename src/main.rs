@@ -34,6 +34,7 @@ async fn main() -> Result<()> {
         let status = Arc::clone(&controller.status);
         let token = config.rush_remote_write_token.clone();
         let tenant = config.rush_remote_write_tenant.clone();
+        let extra_labels = config.extra_labels.clone();
         let interval = config.rush_remote_write_interval;
         let shutdown = shutdown.clone();
         tokio::spawn(remote_write::run(
@@ -46,6 +47,7 @@ async fn main() -> Result<()> {
                 .filter(|url| !url.trim().is_empty()),
             token,
             tenant,
+            extra_labels,
             interval,
             shutdown,
         ))

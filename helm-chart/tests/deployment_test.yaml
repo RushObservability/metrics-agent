@@ -52,3 +52,14 @@ tests:
       - equal:
           path: spec.template.spec.containers[0].image
           value: ghcr.io/rushobservability/metrics-agent@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
+
+  - it: renders extra labels for every remote-write series
+    set:
+      extraLabels:
+        env: dev
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: METRICS_AGENT_EXTRA_LABELS
+            value: '{"env":"dev"}'

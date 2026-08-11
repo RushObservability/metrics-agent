@@ -1,10 +1,31 @@
-use std::{env, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
+use std::{
+    collections::BTreeMap, env, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration,
+};
 
 use anyhow::{Context, Result};
 use clap::Parser;
 
 fn parse_duration(value: &str) -> Result<Duration, String> {
     humantime::parse_duration(value).map_err(|error| error.to_string())
+}
+
+fn parse_extra_labels(value: &str) -> Result<BTreeMap<String, String>, String> {
+    let labels: BTreeMap<String, String> =
+        serde_json::from_str(value).map_err(|error| format!("invalid labels JSON: {error}"))?;
+    for name in labels.keys() {
+        if name == "__name__" {
+            return Err("extra label __name__ is reserved by Prometheus".to_string());
+        }
+        let mut chars = name.chars();
+        if !chars
+            .next()
+            .is_some_and(|character| character == '_' || character.is_ascii_alphabetic())
+            || !chars.all(|character| character == '_' || character.is_ascii_alphanumeric())
+        {
+            return Err(format!("invalid Prometheus label name {name:?}"));
+        }
+    }
+    Ok(labels)
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -59,6 +80,14 @@ pub struct Config {
 
     #[arg(long, env = "RUSH_REMOTE_WRITE_TENANT")]
     pub rush_remote_write_tenant: Option<String>,
+
+    #[arg(
+        long,
+        env = "METRICS_AGENT_EXTRA_LABELS",
+        value_parser = parse_extra_labels,
+        default_value = "{}"
+    )]
+    pub extra_labels: BTreeMap<String, String>,
 
     #[arg(long, env = "METRICS_AGENT_SCRAPE_ENABLED", default_value_t = true)]
     pub scrape_enabled: bool,
@@ -151,7 +180,7 @@ mod tests {
 
     use clap::Parser;
 
-    use super::{Config, parse_duration, parse_listen_address};
+    use super::{Config, parse_duration, parse_extra_labels, parse_listen_address};
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -220,6 +249,8 @@ mod tests {
             "secret-token",
             "--rush-remote-write-tenant",
             "tenant-a",
+            "--extra-labels",
+            r#"{"cluster":"ntt-japan","env":"dev"}"#,
             "--scrape-enabled",
             "--scrape-interval",
             "250ms",
@@ -248,6 +279,14 @@ mod tests {
             Some("secret-token")
         );
         assert_eq!(config.rush_remote_write_tenant.as_deref(), Some("tenant-a"));
+        assert_eq!(
+            config.extra_labels.get("env").map(String::as_str),
+            Some("dev")
+        );
+        assert_eq!(
+            config.extra_labels.get("cluster").map(String::as_str),
+            Some("ntt-japan")
+        );
         assert!(config.scrape_enabled);
         assert_eq!(config.scrape_interval, Duration::from_millis(250));
         assert_eq!(config.scrape_timeout, Duration::from_secs(1));
@@ -268,12 +307,16 @@ mod tests {
         assert_eq!(config.workers, 2);
         assert!(config.ui_enabled);
         assert!(config.scrape_enabled);
+        assert!(config.extra_labels.is_empty());
         assert!(Config::try_parse_from(["metrics-agent", "--workers", "not-a-number"]).is_err());
         assert!(
             Config::try_parse_from(["metrics-agent", "--scrape-timeout", "not-a-duration"])
                 .is_err()
         );
         assert!(Config::try_parse_from(["metrics-agent", "--ui-enabled=maybe"]).is_err());
+        assert!(parse_extra_labels(r#"{"__name__":"invalid"}"#).is_err());
+        assert!(parse_extra_labels(r#"{"bad-label":"invalid"}"#).is_err());
+        assert!(parse_extra_labels(r#"{"env":1}"#).is_err());
     }
 
     struct RestoredEnv {
@@ -309,6 +352,10 @@ mod tests {
         let _scrape = RestoredEnv::set("METRICS_AGENT_SCRAPE_INTERVAL", "275ms");
         let _remote_interval = RestoredEnv::set("RUSH_REMOTE_WRITE_INTERVAL", "2m");
         let _url = RestoredEnv::set("RUSH_REMOTE_WRITE_URL", "http://rush.test/write");
+        let _extra_labels = RestoredEnv::set(
+            "METRICS_AGENT_EXTRA_LABELS",
+            r#"{"cluster":"ntt-japan","env":"dev"}"#,
+        );
 
         let config = Config::try_parse_from(["metrics-agent"]).unwrap();
         assert!(!config.ui_enabled);
@@ -317,6 +364,10 @@ mod tests {
         assert_eq!(
             config.rush_remote_write_url.as_deref(),
             Some("http://rush.test/write")
+        );
+        assert_eq!(
+            config.extra_labels.get("env").map(String::as_str),
+            Some("dev")
         );
     }
 }
