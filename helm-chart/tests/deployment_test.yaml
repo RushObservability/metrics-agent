@@ -42,6 +42,33 @@ tests:
       - contains:
           path: spec.template.spec.containers[0].securityContext.capabilities.drop
           content: ALL
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --scrape-max-response-bytes=4194304
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --scrape-max-samples-per-target=50000
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --scrape-discovery-refresh-interval=60s
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --scrape-concurrency=8
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RUSH_REMOTE_WRITE_TIMEOUT
+            value: "30s"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RUSH_REMOTE_WRITE_CONNECT_TIMEOUT
+            value: "5s"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: METRICS_AGENT_UI_ENABLED
+            value: "false"
 
   - it: supports immutable image references
     set:

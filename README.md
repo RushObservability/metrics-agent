@@ -57,8 +57,8 @@ process with bounded concurrency and bounded remote-write batches.
 Prometheus-compatible remote-write endpoint with optional tenant and bearer
 token routing.
 
-**Inspect.** Serves /livez, /readyz, /metrics, JSON status endpoints, and an
-embedded UI at /ui/ by default.
+**Inspect.** Always serves /livez, /readyz, and /metrics. The detailed JSON
+status endpoints and embedded UI at /ui/ are disabled unless you opt in.
 
 ## How it works
 
@@ -219,17 +219,30 @@ settings are:
 | METRICS_AGENT_RESYNC_PERIOD | 5m | Full CRD resync interval |
 | METRICS_AGENT_WORKERS | 2 | Reconciliation workers |
 | METRICS_AGENT_LOG_LEVEL | info | Log level |
-| METRICS_AGENT_UI_ENABLED | true | Enable the embedded UI |
+| METRICS_AGENT_UI_ENABLED | false | Opt in to the embedded UI and detailed status/cardinality APIs |
 | METRICS_AGENT_UI_ADDRESS | :7070 | UI listener; same listener by default |
 | METRICS_AGENT_UI_PATH | /ui/ | UI mount path |
 | RUSH_REMOTE_WRITE_URL | unset | Rush remote-write endpoint |
 | RUSH_REMOTE_WRITE_INTERVAL | 15s | Self-metrics heartbeat interval |
+| RUSH_REMOTE_WRITE_TIMEOUT | 30s | Maximum duration of one remote-write request |
+| RUSH_REMOTE_WRITE_CONNECT_TIMEOUT | 5s | Maximum time to connect to Rush |
 | RUSH_REMOTE_WRITE_TOKEN | unset | Ingest-only key scoped to `metrics`; omit only for explicitly open ingestion |
 | RUSH_REMOTE_WRITE_TENANT | unset | Optional routing hint; never grants access without a matching key |
 | METRICS_AGENT_EXTRA_LABELS | `{}` | JSON map added to every remote-write series; configured values win on collision |
 | METRICS_AGENT_SCRAPE_ENABLED | true | Enable discovered-target scraping |
 | METRICS_AGENT_SCRAPE_INTERVAL | 15s | Scrape cycle interval |
 | METRICS_AGENT_SCRAPE_TIMEOUT | 10s | Per-target HTTP timeout |
+| METRICS_AGENT_SCRAPE_DISCOVERY_REFRESH_INTERVAL | 60s | Maximum age of the compiled Kubernetes target cache |
+| METRICS_AGENT_SCRAPE_CONCURRENCY | 8 | Maximum number of targets scraped concurrently |
+| METRICS_AGENT_SCRAPE_ALLOWED_NAMESPACES | empty | Comma-separated namespaces allowed to define scrape objects |
+| METRICS_AGENT_SCRAPE_ALLOWED_DESTINATIONS | empty | Exact hosts/IPs or `*.suffix` patterns allowed to override blocked destinations |
+| METRICS_AGENT_SCRAPE_MAX_RESPONSE_BYTES | 4194304 | Maximum response body per target |
+| METRICS_AGENT_SCRAPE_MAX_SAMPLES_PER_TARGET | 50000 | Maximum parsed samples per target |
+| METRICS_AGENT_SCRAPE_MAX_LABELS_PER_SAMPLE | 64 | Maximum merged target and sample labels |
+| METRICS_AGENT_SCRAPE_MAX_LABEL_NAME_BYTES | 256 | Maximum label-name length |
+| METRICS_AGENT_SCRAPE_MAX_LABEL_VALUE_BYTES | 4096 | Maximum label-value and HELP-text length |
+| METRICS_AGENT_SCRAPE_MAX_METRIC_NAME_BYTES | 1024 | Maximum metric-name length |
+| METRICS_AGENT_SCRAPE_MAX_LINE_BYTES | 65536 | Maximum exposition line length |
 | METRICS_AGENT_VERSION | dev | Version shown in status and UI |
 
 The Helm chart exposes these through helm-chart/values.yaml, including UI, security
@@ -247,7 +260,9 @@ settings.
 | GET /api/v1/metrics-summary | Status plus metric examples |
 | GET /ui/ | Embedded control-room UI |
 
-Port-forward a deployed agent to inspect it locally:
+The last three endpoints return 404 unless `METRICS_AGENT_UI_ENABLED=true`.
+Enable them only for local inspection or behind restricted ingress, then
+port-forward the deployed agent:
 
     kubectl -n monitoring port-forward svc/metrics-agent 7070:7070
     open http://localhost:7070/ui/
@@ -296,6 +311,13 @@ Then query Rush through query-api:
 - The default ServiceAccount uses only the cluster-scoped read/watch permissions
   required for scrape discovery plus patch access to the supported VictoriaMetrics
   scrape resources; it has no Events write permission.
+- Scrape responses are streamed into a fixed per-target byte budget. Response,
+  sample, line, metric-name, and label limits reject the target before any
+  partial payload is published.
+- Scrape redirects are disabled. The agent rejects loopback, link-local, cloud
+  metadata, and Kubernetes API destinations before sending a request, including
+  DNS names that resolve to a blocked address. Destination exceptions must be
+  explicit. A namespace allowlist can restrict which teams define targets.
 - The container runs non-root with a read-only filesystem and all Linux
   capabilities dropped, privilege escalation disabled, RuntimeDefault seccomp,
   and host namespaces disabled.

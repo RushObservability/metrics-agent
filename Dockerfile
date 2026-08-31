@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
-ARG CHAINGUARD_RUST_IMAGE=cgr.dev/chainguard/rust:latest
-ARG CHAINGUARD_RUNTIME_IMAGE=cgr.dev/chainguard/glibc-dynamic:latest
+ARG CHAINGUARD_RUST_IMAGE=cgr.dev/chainguard/rust:latest@sha256:6c42dfb2cad5356d7c043155f896c5bd8e8777377ff21b6c78ee2113f6ee092d
+ARG CHAINGUARD_RUNTIME_IMAGE=cgr.dev/chainguard/glibc-dynamic:latest@sha256:d0046044cd28948d3380eb0d98709dc7e63f98161fe7105135e1025650bad17a
 
 FROM ${CHAINGUARD_RUST_IMAGE} AS build
 

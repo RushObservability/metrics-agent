@@ -22,6 +22,22 @@ scrape:
   enabled: true
   interval: 15s
   timeout: 10s
+  discoveryRefreshInterval: 60s
+  concurrency: 8
+  # Per-target resource bounds. A target that exceeds any limit fails its
+  # scrape without publishing a partial payload.
+  maxResponseBytes: 4194304
+  maxSamplesPerTarget: 50000
+  maxLabelsPerSample: 64
+  maxLabelNameBytes: 256
+  maxLabelValueBytes: 4096
+  maxMetricNameBytes: 1024
+  maxLineBytes: 65536
+  # Empty allows scrape objects from every namespace visible to the agent.
+  allowedNamespaces: []
+  # Exact hosts/IPs and `*.suffix` patterns that may override the built-in
+  # block on loopback, link-local, metadata, and Kubernetes API destinations.
+  allowedDestinations: []
 
 serviceAccount:
   create: true
@@ -91,9 +107,9 @@ service:
   annotations: {}
 
 ui:
-  # The embedded UI is enabled by default and is served through the existing
-  # metrics-agent HTTP Service.
-  enabled: true
+  # Detailed status and cardinality data is exposed only when this opt-in UI is
+  # enabled. Use port-forwarding or a restrictive NetworkPolicy when enabling it.
+  enabled: false
   path: /ui/
   # Empty uses service.port. Set this only when the UI/server should listen on
   # a different port; the chart will expose that port through the Service.
@@ -126,6 +142,8 @@ rushRemoteWrite:
   enabled: false
   url: ""
   interval: 15s
+  timeout: 30s
+  connectTimeout: 5s
   # Set true only when the target Rush tenant explicitly has "Require ingest
   # key" disabled. Otherwise bearerTokenSecret.name is required.
   allowAnonymous: false

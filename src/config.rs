@@ -9,6 +9,16 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
     humantime::parse_duration(value).map_err(|error| error.to_string())
 }
 
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let value = value
+        .parse::<usize>()
+        .map_err(|error| format!("invalid positive integer: {error}"))?;
+    if value == 0 {
+        return Err("value must be greater than zero".to_string());
+    }
+    Ok(value)
+}
+
 fn parse_extra_labels(value: &str) -> Result<BTreeMap<String, String>, String> {
     let labels: BTreeMap<String, String> =
         serde_json::from_str(value).map_err(|error| format!("invalid labels JSON: {error}"))?;
@@ -55,7 +65,7 @@ pub struct Config {
     #[arg(long, env = "METRICS_AGENT_LOG_LEVEL", default_value = "info")]
     pub log_level: String,
 
-    #[arg(long, env = "METRICS_AGENT_UI_ENABLED", default_value_t = true)]
+    #[arg(long, env = "METRICS_AGENT_UI_ENABLED", default_value_t = false)]
     pub ui_enabled: bool,
 
     #[arg(long, env = "METRICS_AGENT_UI_ADDRESS", default_value = ":7070")]
@@ -74,6 +84,22 @@ pub struct Config {
         default_value = "15s"
     )]
     pub rush_remote_write_interval: Duration,
+
+    #[arg(
+        long,
+        env = "RUSH_REMOTE_WRITE_TIMEOUT",
+        value_parser = parse_duration,
+        default_value = "30s"
+    )]
+    pub rush_remote_write_timeout: Duration,
+
+    #[arg(
+        long,
+        env = "RUSH_REMOTE_WRITE_CONNECT_TIMEOUT",
+        value_parser = parse_duration,
+        default_value = "5s"
+    )]
+    pub rush_remote_write_connect_timeout: Duration,
 
     #[arg(long, env = "RUSH_REMOTE_WRITE_TOKEN")]
     pub rush_remote_write_token: Option<String>,
@@ -107,6 +133,96 @@ pub struct Config {
         default_value = "10s"
     )]
     pub scrape_timeout: Duration,
+
+    #[arg(
+        long,
+        env = "METRICS_AGENT_SCRAPE_DISCOVERY_REFRESH_INTERVAL",
+        value_parser = parse_duration,
+        default_value = "60s"
+    )]
+    pub scrape_discovery_refresh_interval: Duration,
+
+    #[arg(
+        long,
+        env = "METRICS_AGENT_SCRAPE_CONCURRENCY",
+        value_parser = parse_positive_usize,
+        default_value_t = 8
+    )]
+    pub scrape_concurrency: usize,
+
+    /// Source namespaces whose scrape objects may create targets. Empty means
+    /// all namespaces visible to the controller.
+    #[arg(
+        long,
+        env = "METRICS_AGENT_SCRAPE_ALLOWED_NAMESPACES",
+        value_delimiter = ','
+    )]
+    pub scrape_allowed_namespaces: Vec<String>,
+
+    /// Exact hosts, IP addresses, or `*.suffix` patterns that may override the
+    /// built-in destination denylist. This is intentionally empty by default.
+    #[arg(
+        long,
+        env = "METRICS_AGENT_SCRAPE_ALLOWED_DESTINATIONS",
+        value_delimiter = ','
+    )]
+    pub scrape_allowed_destinations: Vec<String>,
+
+    #[arg(
+        long,
+        env = "METRICS_AGENT_SCRAPE_MAX_RESPONSE_BYTES",
+        value_parser = parse_positive_usize,
+        default_value_t = 4_194_304
+    )]
+    pub scrape_max_response_bytes: usize,
+
+    #[arg(
+        long,
+        env = "METRICS_AGENT_SCRAPE_MAX_SAMPLES_PER_TARGET",
+        value_parser = parse_positive_usize,
+        default_value_t = 50_000
+    )]
+    pub scrape_max_samples_per_target: usize,
+
+    #[arg(
+        long,
+        env = "METRICS_AGENT_SCRAPE_MAX_LABELS_PER_SAMPLE",
+        value_parser = parse_positive_usize,
+        default_value_t = 64
+    )]
+    pub scrape_max_labels_per_sample: usize,
+
+    #[arg(
+        long,
+        env = "METRICS_AGENT_SCRAPE_MAX_LABEL_NAME_BYTES",
+        value_parser = parse_positive_usize,
+        default_value_t = 256
+    )]
+    pub scrape_max_label_name_bytes: usize,
+
+    #[arg(
+        long,
+        env = "METRICS_AGENT_SCRAPE_MAX_LABEL_VALUE_BYTES",
+        value_parser = parse_positive_usize,
+        default_value_t = 4_096
+    )]
+    pub scrape_max_label_value_bytes: usize,
+
+    #[arg(
+        long,
+        env = "METRICS_AGENT_SCRAPE_MAX_METRIC_NAME_BYTES",
+        value_parser = parse_positive_usize,
+        default_value_t = 1_024
+    )]
+    pub scrape_max_metric_name_bytes: usize,
+
+    #[arg(
+        long,
+        env = "METRICS_AGENT_SCRAPE_MAX_LINE_BYTES",
+        value_parser = parse_positive_usize,
+        default_value_t = 65_536
+    )]
+    pub scrape_max_line_bytes: usize,
 
     #[arg(long, env = "METRICS_AGENT_VERSION", default_value = "dev")]
     pub agent_version: String,
@@ -180,7 +296,9 @@ mod tests {
 
     use clap::Parser;
 
-    use super::{Config, parse_duration, parse_extra_labels, parse_listen_address};
+    use super::{
+        Config, parse_duration, parse_extra_labels, parse_listen_address, parse_positive_usize,
+    };
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -245,6 +363,10 @@ mod tests {
             "http://rush.test/write",
             "--rush-remote-write-interval",
             "2m",
+            "--rush-remote-write-timeout",
+            "12s",
+            "--rush-remote-write-connect-timeout",
+            "3s",
             "--rush-remote-write-token",
             "secret-token",
             "--rush-remote-write-tenant",
@@ -256,6 +378,28 @@ mod tests {
             "250ms",
             "--scrape-timeout",
             "1s",
+            "--scrape-discovery-refresh-interval",
+            "45s",
+            "--scrape-concurrency",
+            "12",
+            "--scrape-allowed-namespaces",
+            "monitoring,apps",
+            "--scrape-allowed-destinations",
+            "metrics.internal,*.trusted.example",
+            "--scrape-max-response-bytes",
+            "1048576",
+            "--scrape-max-samples-per-target",
+            "1234",
+            "--scrape-max-labels-per-sample",
+            "32",
+            "--scrape-max-label-name-bytes",
+            "128",
+            "--scrape-max-label-value-bytes",
+            "2048",
+            "--scrape-max-metric-name-bytes",
+            "512",
+            "--scrape-max-line-bytes",
+            "32768",
             "--agent-version",
             "1.2.3",
         ])
@@ -274,6 +418,11 @@ mod tests {
             Some("http://rush.test/write")
         );
         assert_eq!(config.rush_remote_write_interval, Duration::from_secs(120));
+        assert_eq!(config.rush_remote_write_timeout, Duration::from_secs(12));
+        assert_eq!(
+            config.rush_remote_write_connect_timeout,
+            Duration::from_secs(3)
+        );
         assert_eq!(
             config.rush_remote_write_token.as_deref(),
             Some("secret-token")
@@ -290,6 +439,23 @@ mod tests {
         assert!(config.scrape_enabled);
         assert_eq!(config.scrape_interval, Duration::from_millis(250));
         assert_eq!(config.scrape_timeout, Duration::from_secs(1));
+        assert_eq!(
+            config.scrape_discovery_refresh_interval,
+            Duration::from_secs(45)
+        );
+        assert_eq!(config.scrape_concurrency, 12);
+        assert_eq!(config.scrape_allowed_namespaces, ["monitoring", "apps"]);
+        assert_eq!(
+            config.scrape_allowed_destinations,
+            ["metrics.internal", "*.trusted.example"]
+        );
+        assert_eq!(config.scrape_max_response_bytes, 1_048_576);
+        assert_eq!(config.scrape_max_samples_per_target, 1_234);
+        assert_eq!(config.scrape_max_labels_per_sample, 32);
+        assert_eq!(config.scrape_max_label_name_bytes, 128);
+        assert_eq!(config.scrape_max_label_value_bytes, 2_048);
+        assert_eq!(config.scrape_max_metric_name_bytes, 512);
+        assert_eq!(config.scrape_max_line_bytes, 32_768);
         assert_eq!(config.agent_version, "1.2.3");
     }
 
@@ -302,10 +468,29 @@ mod tests {
         assert_eq!(config.ui_path, "/ui/");
         assert_eq!(config.resync_period, Duration::from_secs(300));
         assert_eq!(config.rush_remote_write_interval, Duration::from_secs(15));
+        assert_eq!(config.rush_remote_write_timeout, Duration::from_secs(30));
+        assert_eq!(
+            config.rush_remote_write_connect_timeout,
+            Duration::from_secs(5)
+        );
         assert_eq!(config.scrape_interval, Duration::from_secs(15));
         assert_eq!(config.scrape_timeout, Duration::from_secs(10));
+        assert_eq!(
+            config.scrape_discovery_refresh_interval,
+            Duration::from_secs(60)
+        );
+        assert_eq!(config.scrape_concurrency, 8);
+        assert!(config.scrape_allowed_namespaces.is_empty());
+        assert!(config.scrape_allowed_destinations.is_empty());
+        assert_eq!(config.scrape_max_response_bytes, 4_194_304);
+        assert_eq!(config.scrape_max_samples_per_target, 50_000);
+        assert_eq!(config.scrape_max_labels_per_sample, 64);
+        assert_eq!(config.scrape_max_label_name_bytes, 256);
+        assert_eq!(config.scrape_max_label_value_bytes, 4_096);
+        assert_eq!(config.scrape_max_metric_name_bytes, 1_024);
+        assert_eq!(config.scrape_max_line_bytes, 65_536);
         assert_eq!(config.workers, 2);
-        assert!(config.ui_enabled);
+        assert!(!config.ui_enabled);
         assert!(config.scrape_enabled);
         assert!(config.extra_labels.is_empty());
         assert!(Config::try_parse_from(["metrics-agent", "--workers", "not-a-number"]).is_err());
@@ -317,6 +502,8 @@ mod tests {
         assert!(parse_extra_labels(r#"{"__name__":"invalid"}"#).is_err());
         assert!(parse_extra_labels(r#"{"bad-label":"invalid"}"#).is_err());
         assert!(parse_extra_labels(r#"{"env":1}"#).is_err());
+        assert!(parse_positive_usize("0").is_err());
+        assert!(parse_positive_usize("-1").is_err());
     }
 
     struct RestoredEnv {

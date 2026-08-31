@@ -93,6 +93,24 @@ pub fn render(snapshot: &StatusSnapshot) -> String {
         "Number of scrape targets that failed during the last scrape cycle.",
         snapshot.scrape.errors,
     );
+    gauge(
+        &mut output,
+        "metrics_agent_scrape_duration_milliseconds",
+        "Wall time of the last scrape cycle in milliseconds.",
+        snapshot.scrape.duration_ms,
+    );
+    gauge(
+        &mut output,
+        "metrics_agent_discovery_duration_milliseconds",
+        "Wall time spent refreshing scrape target discovery in milliseconds.",
+        snapshot.scrape.discovery_duration_ms,
+    );
+    gauge(
+        &mut output,
+        "metrics_agent_discovery_cache_hit",
+        "Whether the last scrape reused the bounded target cache.",
+        snapshot.scrape.discovery_cache_hit as u64,
+    );
 
     output.push_str("# HELP metrics_agent_crd_available Whether the configured scrape CRD is available.\n# TYPE metrics_agent_crd_available gauge\n");
     output.push_str("# HELP metrics_agent_observed_crd_objects Number of observed scrape CRD objects.\n# TYPE metrics_agent_observed_crd_objects gauge\n");
@@ -166,6 +184,14 @@ pub fn render(snapshot: &StatusSnapshot) -> String {
             "metrics_agent_remote_write_samples",
             "Samples included in the last Rush remote-write payload.",
             samples,
+        );
+    }
+    if let Some(duration_ms) = snapshot.remote_write.last_duration_ms {
+        gauge(
+            &mut output,
+            "metrics_agent_remote_write_duration_milliseconds",
+            "Wall time of the last Rush remote-write cycle in milliseconds.",
+            duration_ms,
         );
     }
     output
@@ -263,6 +289,9 @@ mod tests {
                 healthy_targets: 9,
                 samples: 1000,
                 errors: 1,
+                duration_ms: 250,
+                discovery_duration_ms: 12,
+                discovery_cache_hit: false,
                 last_scrape_at: Some("2026-07-25T00:00:00Z".into()),
                 last_error: Some("one target failed".into()),
             },
@@ -279,6 +308,7 @@ mod tests {
                 last_publish_at: Some("2026-07-25T00:00:00Z".into()),
                 last_series: Some(77),
                 last_samples: Some(88),
+                last_duration_ms: Some(23),
                 last_error: None,
             },
             ui: UiStatus {
@@ -325,6 +355,7 @@ mod tests {
             last_publish_at: Some("2026-07-25T00:00:00Z".into()),
             last_series: None,
             last_samples: None,
+            last_duration_ms: Some(30_000),
             last_error: Some("connection refused".into()),
         };
 
