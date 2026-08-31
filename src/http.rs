@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     extract::State,
-    http::{StatusCode, header},
+    http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Redirect, Response},
     routing::get,
 };
@@ -58,6 +58,28 @@ fn ui_route_paths(path: &str) -> [String; 4] {
 
 fn ui_disabled_response() -> Response {
     (StatusCode::NOT_FOUND, "metrics-agent UI is disabled\n").into_response()
+}
+
+fn diagnostics_disabled_response(enabled: bool) -> Option<Response> {
+    if enabled {
+        None
+    } else {
+        Some(
+            (
+                StatusCode::NOT_FOUND,
+                "metrics-agent diagnostics are disabled\n",
+            )
+                .into_response(),
+        )
+    }
+}
+
+fn no_store_json<T: serde::Serialize>(value: T) -> Response {
+    let mut response = Json(value).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 fn ui_redirect_response(enabled: bool, path: &str) -> Response {
@@ -133,21 +155,26 @@ async fn prometheus_metrics(State(controller): State<Arc<Controller>>) -> impl I
     )
 }
 
-async fn status(State(controller): State<Arc<Controller>>) -> Json<crate::status::StatusSnapshot> {
-    Json(controller.status.snapshot().await)
+async fn status(State(controller): State<Arc<Controller>>) -> Response {
+    if let Some(response) = diagnostics_disabled_response(controller.config().ui_enabled) {
+        return response;
+    }
+    no_store_json(controller.status.snapshot().await)
 }
 
-async fn metrics_summary(
-    State(controller): State<Arc<Controller>>,
-) -> Json<crate::status::MetricsSummary> {
-    Json(controller.status.metrics_summary().await)
+async fn metrics_summary(State(controller): State<Arc<Controller>>) -> Response {
+    if let Some(response) = diagnostics_disabled_response(controller.config().ui_enabled) {
+        return response;
+    }
+    no_store_json(controller.status.metrics_summary().await)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        UI_APP, UI_INDEX, UI_STYLES, livez, normalize_ui_path, readiness_response,
-        ui_asset_response, ui_redirect_response, ui_route_paths,
+        UI_APP, UI_INDEX, UI_STYLES, diagnostics_disabled_response, livez, no_store_json,
+        normalize_ui_path, readiness_response, ui_asset_response, ui_redirect_response,
+        ui_route_paths,
     };
     use axum::{
         body::to_bytes,
@@ -228,6 +255,18 @@ mod tests {
             let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
             assert_eq!(body.as_ref(), b"metrics-agent UI is disabled\n");
         }
+    }
+
+    #[tokio::test]
+    async fn detailed_diagnostics_are_opt_in_and_not_cacheable() {
+        let disabled = diagnostics_disabled_response(false).unwrap();
+        assert_eq!(disabled.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(disabled.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body.as_ref(), b"metrics-agent diagnostics are disabled\n");
+        assert!(diagnostics_disabled_response(true).is_none());
+
+        let response = no_store_json(serde_json::json!({ "status": "ok" }));
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     }
 
     #[test]

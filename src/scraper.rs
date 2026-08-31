@@ -7,10 +7,12 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    net::{IpAddr, Ipv4Addr},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use futures_util::{StreamExt, stream};
 use kube::{
     Client,
@@ -18,6 +20,7 @@ use kube::{
     core::GroupVersionKind,
 };
 use reqwest::Url;
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use serde_json::Value;
 use tokio::{sync::mpsc, time};
 use tokio_util::sync::CancellationToken;
@@ -25,7 +28,7 @@ use tracing::{debug, warn};
 
 use crate::{
     controller::{Controller, ResourcePair},
-    remote_write::{CollectedMetric, ScrapeMessage, parse_prometheus_text},
+    remote_write::{CollectedMetric, PrometheusTextParser, ScrapeLimits, ScrapeMessage},
     status::{MetricCardinality, ScrapeStatus},
 };
 
@@ -52,6 +55,55 @@ struct DiscoveryData {
     pods: Vec<Value>,
 }
 
+#[derive(Default)]
+struct TargetCache {
+    refreshed_at: Option<Instant>,
+    targets: Arc<[ScrapeTarget]>,
+}
+
+impl TargetCache {
+    async fn get(
+        &mut self,
+        client: Client,
+        pairs: &[ResourcePair],
+        refresh_interval: Duration,
+    ) -> Result<(Arc<[ScrapeTarget]>, u64, bool)> {
+        let fresh = self
+            .refreshed_at
+            .is_some_and(|refreshed_at| refreshed_at.elapsed() < refresh_interval);
+        if fresh {
+            return Ok((Arc::clone(&self.targets), 0, true));
+        }
+
+        let started = Instant::now();
+        match discover_targets(client, pairs).await {
+            Ok(targets) => {
+                let duration_ms = started.elapsed().as_millis() as u64;
+                let targets: Arc<[ScrapeTarget]> = targets.into();
+                self.targets = Arc::clone(&targets);
+                self.refreshed_at = Some(Instant::now());
+                Ok((targets, duration_ms, false))
+            }
+            Err(error) => {
+                let stale_allowed = self.refreshed_at.is_some_and(|refreshed_at| {
+                    refreshed_at.elapsed()
+                        < refresh_interval.checked_mul(2).unwrap_or(Duration::MAX)
+                });
+                if stale_allowed && !self.targets.is_empty() {
+                    warn!(%error, "scrape target refresh failed; using bounded stale discovery data");
+                    Ok((
+                        Arc::clone(&self.targets),
+                        started.elapsed().as_millis() as u64,
+                        true,
+                    ))
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+}
+
 pub async fn run(
     controller: Arc<Controller>,
     sender: mpsc::Sender<ScrapeMessage>,
@@ -60,6 +112,13 @@ pub async fn run(
     let http = match reqwest::Client::builder()
         .timeout(controller.config().scrape_timeout)
         .user_agent("rush-metrics-agent")
+        // A redirect target has not passed the destination checks below.
+        .redirect(reqwest::redirect::Policy::none())
+        // Re-check every connection-time DNS answer so a name cannot pass the
+        // discovery check and then rebind to a protected address.
+        .dns_resolver(Arc::new(SafeResolver {
+            allowed: controller.config().scrape_allowed_destinations.clone(),
+        }))
         .build()
     {
         Ok(client) => client,
@@ -69,21 +128,28 @@ pub async fn run(
         }
     };
     let mut interval = time::interval(controller.config().scrape_interval);
+    interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
+    let mut target_cache = TargetCache::default();
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return,
             _ = interval.tick() => {
                 controller.status.begin_scrape().await;
-                let result = scrape_once(&controller, &http, &sender).await;
+                let started = Instant::now();
+                let result = scrape_once(&controller, &http, &sender, &mut target_cache).await;
+                let duration_ms = started.elapsed().as_millis() as u64;
                 let timestamp = chrono::Utc::now().to_rfc3339();
                 match result {
-                    Ok((targets, healthy, samples)) => {
+                    Ok((targets, healthy, samples, discovery_duration_ms, discovery_cache_hit)) => {
                         controller.status.set_scrape_status(ScrapeStatus {
                             enabled: true,
                             targets: targets as u64,
                             healthy_targets: healthy as u64,
                             samples,
                             errors: targets.saturating_sub(healthy) as u64,
+                            duration_ms,
+                            discovery_duration_ms,
+                            discovery_cache_hit,
                             last_scrape_at: Some(timestamp),
                             last_error: None,
                         }).await;
@@ -101,6 +167,7 @@ pub async fn run(
                             enabled: true,
                             last_scrape_at: Some(timestamp),
                             last_error: Some(error.to_string()),
+                            duration_ms,
                             ..Default::default()
                         }).await;
                     }
@@ -114,27 +181,72 @@ async fn scrape_once(
     controller: &Controller,
     http: &reqwest::Client,
     sender: &mpsc::Sender<ScrapeMessage>,
-) -> Result<(usize, usize, u64)> {
-    let targets = discover_targets(controller.kube_client(), controller.resource_pairs()).await?;
+    target_cache: &mut TargetCache,
+) -> Result<(usize, usize, u64, u64, bool)> {
+    let (targets, discovery_duration_ms, discovery_cache_hit) = target_cache
+        .get(
+            controller.kube_client(),
+            controller.resource_pairs(),
+            controller.config().scrape_discovery_refresh_interval,
+        )
+        .await?;
+    let limits = ScrapeLimits {
+        max_response_bytes: controller.config().scrape_max_response_bytes,
+        max_samples_per_target: controller.config().scrape_max_samples_per_target,
+        max_labels_per_sample: controller.config().scrape_max_labels_per_sample,
+        max_label_name_bytes: controller.config().scrape_max_label_name_bytes,
+        max_label_value_bytes: controller.config().scrape_max_label_value_bytes,
+        max_metric_name_bytes: controller.config().scrape_max_metric_name_bytes,
+        max_line_bytes: controller.config().scrape_max_line_bytes,
+    };
     let total = targets.len();
     sender
         .send(ScrapeMessage::Start { targets: total })
         .await
         .context("metrics remote-write channel closed")?;
-    let mut results = stream::iter(targets.into_iter().map(|target| async move {
-        let identity = target.identity.clone();
-        let labels = target.labels.clone();
-        let response = http.get(&target.url).send().await?.error_for_status()?;
-        let body = response.text().await?;
-        let metrics = parse_prometheus_text(&body, &labels, chrono::Utc::now().timestamp_millis());
-        Ok::<_, anyhow::Error>((identity, metrics))
+    let mut results = stream::iter((0..total).map(|index| {
+        let targets = Arc::clone(&targets);
+        async move {
+            let target = &targets[index];
+            let identity = &target.identity;
+            if !namespace_allowed(
+                &identity.namespace,
+                &controller.config().scrape_allowed_namespaces,
+            ) {
+                bail!("scrape source namespace is not allowed");
+            }
+            let url = validate_scrape_url(
+                &target.url,
+                &controller.config().scrape_allowed_destinations,
+            )?;
+            let response = http
+                .get(url)
+                .send()
+                .await
+                .map_err(|_| anyhow::anyhow!("scrape request failed"))?;
+            if response.status().is_redirection() {
+                bail!("scrape redirects are disabled");
+            }
+            if !response.status().is_success() {
+                bail!("scrape returned HTTP {}", response.status());
+            }
+            let metrics = parse_bounded_response(
+                response,
+                &target.labels,
+                chrono::Utc::now().timestamp_millis(),
+                limits,
+            )
+            .await?;
+            Ok::<_, anyhow::Error>((index, metrics))
+        }
     }))
-    .buffer_unordered(8);
+    .buffer_unordered(controller.config().scrape_concurrency);
     let mut healthy = 0;
     let mut samples = 0;
     while let Some(result) = results.next().await {
         match result {
-            Ok((identity, metrics)) => {
+            Ok((index, metrics)) => {
+                let identity = &targets[index].identity;
                 healthy += 1;
                 let target_samples = metrics.len() as u64;
                 let mut counts = HashMap::new();
@@ -144,11 +256,11 @@ async fn scrape_once(
                 controller
                     .status
                     .record_crd_metrics(
-                        identity.key,
-                        identity.pair,
-                        identity.source,
-                        identity.namespace,
-                        identity.name,
+                        identity.key.clone(),
+                        identity.pair.clone(),
+                        identity.source.clone(),
+                        identity.namespace.clone(),
+                        identity.name.clone(),
                         target_samples,
                         counts
                             .into_iter()
@@ -157,7 +269,7 @@ async fn scrape_once(
                     .await;
                 samples += send_metric_chunks(sender, metrics).await?;
             }
-            Err(error) => debug!(error = %error, "scrape target failed"),
+            Err(error) => debug!(reason = target_error_key(&error), "scrape target failed"),
         }
     }
     sender
@@ -169,23 +281,241 @@ async fn scrape_once(
         })
         .await
         .context("metrics remote-write channel closed")?;
-    Ok((total, healthy, samples))
+    Ok((
+        total,
+        healthy,
+        samples,
+        discovery_duration_ms,
+        discovery_cache_hit,
+    ))
+}
+
+fn target_error_key(error: &anyhow::Error) -> &'static str {
+    let message = error.to_string();
+    if message.contains("namespace") {
+        "namespace_denied"
+    } else if message.contains("destination") || message.contains("URL") {
+        "destination_denied"
+    } else if message.contains("redirect") {
+        "redirect_denied"
+    } else if message.contains("too large") || message.contains("limit") {
+        "resource_limit"
+    } else {
+        "request_failed"
+    }
+}
+
+fn namespace_allowed(namespace: &str, allowed: &[String]) -> bool {
+    allowed.is_empty()
+        || allowed
+            .iter()
+            .any(|candidate| candidate.trim() == namespace)
+}
+
+fn destination_explicitly_allowed(host: &str, allowed: &[String]) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    allowed.iter().any(|candidate| {
+        let candidate = candidate.trim().trim_end_matches('.').to_ascii_lowercase();
+        if let Some(suffix) = candidate.strip_prefix("*.") {
+            host != suffix && host.ends_with(&format!(".{suffix}"))
+        } else {
+            !candidate.is_empty() && host == candidate
+        }
+    })
+}
+
+fn kubernetes_api_host(host: &str) -> bool {
+    let normalized = host.trim_end_matches('.').to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "kubernetes" | "kubernetes.default" | "kubernetes.default.svc"
+    ) || normalized.starts_with("kubernetes.default.svc.")
+    {
+        return true;
+    }
+    std::env::var("KUBERNETES_SERVICE_HOST")
+        .ok()
+        .is_some_and(|configured| configured.trim_matches(['[', ']']) == normalized)
+}
+
+fn kubernetes_service_ip() -> Option<IpAddr> {
+    std::env::var("KUBERNETES_SERVICE_HOST")
+        .ok()
+        .and_then(|configured| configured.trim_matches(['[', ']']).parse().ok())
+}
+
+fn unsafe_destination_ip(ip: IpAddr) -> bool {
+    if kubernetes_service_ip() == Some(ip) {
+        return true;
+    }
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip == Ipv4Addr::new(169, 254, 169, 254)
+        }
+        IpAddr::V6(ip) => {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || (ip.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SafeResolver {
+    allowed: Vec<String>,
+}
+
+impl Resolve for SafeResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_string();
+        let allowed = destination_explicitly_allowed(&host, &self.allowed);
+        Box::pin(async move {
+            if !allowed && kubernetes_api_host(&host) {
+                return Err(resolution_denied());
+            }
+            let addresses = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|error| {
+                    Box::new(error) as Box<dyn std::error::Error + Send + Sync + 'static>
+                })?
+                .collect::<Vec<_>>();
+            if addresses.is_empty()
+                || (!allowed
+                    && addresses
+                        .iter()
+                        .any(|address| unsafe_destination_ip(address.ip())))
+            {
+                return Err(resolution_denied());
+            }
+            Ok(Box::new(addresses.into_iter()) as Addrs)
+        })
+    }
+}
+
+fn resolution_denied() -> Box<dyn std::error::Error + Send + Sync + 'static> {
+    Box::new(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "scrape destination is blocked",
+    ))
+}
+
+fn validate_scrape_url(raw: &str, allowed: &[String]) -> Result<Url> {
+    let url = Url::parse(raw).context("scrape target is not a valid URL")?;
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!("scrape target URL scheme is not allowed");
+    }
+    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
+        bail!("scrape target URL contains forbidden credentials or fragment");
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| anyhow::anyhow!("scrape target URL has no host"))?;
+    if destination_explicitly_allowed(host, allowed) {
+        return Ok(url);
+    }
+    if kubernetes_api_host(host) {
+        bail!("scrape destination is blocked");
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if unsafe_destination_ip(ip) {
+            bail!("scrape destination is blocked");
+        }
+        return Ok(url);
+    }
+
+    // Hostname resolution and IP-range enforcement happen in SafeResolver at
+    // connection time. A separate preflight lookup doubles DNS work and still
+    // cannot prevent rebinding between validation and connection.
+    Ok(url)
+}
+
+async fn parse_bounded_response(
+    response: reqwest::Response,
+    target_labels: &[(String, String)],
+    default_timestamp: i64,
+    limits: ScrapeLimits,
+) -> Result<Vec<CollectedMetric>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limits.max_response_bytes as u64)
+    {
+        bail!("scrape response exceeds the configured byte limit");
+    }
+    let mut parser = PrometheusTextParser::new(target_labels, default_timestamp, limits)?;
+    let mut pending = Vec::with_capacity(limits.max_line_bytes.min(8_192));
+    let mut total_bytes = 0usize;
+    let mut chunks = response.bytes_stream();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.context("reading scrape response body")?;
+        account_response_bytes(&mut total_bytes, chunk.len(), limits.max_response_bytes)?;
+        pending.extend_from_slice(&chunk);
+
+        let mut consumed = 0usize;
+        for newline in pending
+            .iter()
+            .enumerate()
+            .filter_map(|(index, byte)| (*byte == b'\n').then_some(index))
+        {
+            let mut line = &pending[consumed..newline];
+            if line.last() == Some(&b'\r') {
+                line = &line[..line.len() - 1];
+            }
+            parser.push_line(
+                std::str::from_utf8(line).context("scrape response is not valid UTF-8")?,
+            )?;
+            consumed = newline + 1;
+        }
+        if consumed > 0 {
+            pending.drain(..consumed);
+        }
+        if pending.len() > limits.max_line_bytes {
+            bail!("Prometheus exposition line exceeds the configured byte limit");
+        }
+    }
+    if !pending.is_empty() {
+        parser.push_line(
+            std::str::from_utf8(&pending).context("scrape response is not valid UTF-8")?,
+        )?;
+    }
+    Ok(parser.finish())
+}
+
+fn account_response_bytes(total: &mut usize, chunk_bytes: usize, max_bytes: usize) -> Result<()> {
+    if chunk_bytes > max_bytes.saturating_sub(*total) {
+        bail!("scrape response exceeds the configured byte limit");
+    }
+    *total += chunk_bytes;
+    Ok(())
 }
 
 async fn send_metric_chunks(
     sender: &mpsc::Sender<ScrapeMessage>,
-    mut metrics: Vec<CollectedMetric>,
+    metrics: Vec<CollectedMetric>,
 ) -> Result<u64> {
-    let mut samples = 0;
-    while !metrics.is_empty() {
-        let split_at = metrics.len().min(10_000);
-        let remainder = metrics.split_off(split_at);
-        samples += split_at as u64;
+    let samples = metrics.len() as u64;
+    let mut chunk = Vec::with_capacity(10_000);
+    for metric in metrics {
+        chunk.push(metric);
+        if chunk.len() == 10_000 {
+            sender
+                .send(ScrapeMessage::Batch(std::mem::replace(
+                    &mut chunk,
+                    Vec::with_capacity(10_000),
+                )))
+                .await
+                .context("metrics remote-write channel closed")?;
+        }
+    }
+    if !chunk.is_empty() {
         sender
-            .send(ScrapeMessage::Batch(metrics))
+            .send(ScrapeMessage::Batch(chunk))
             .await
             .context("metrics remote-write channel closed")?;
-        metrics = remainder;
     }
     Ok(samples)
 }
@@ -680,12 +1010,16 @@ fn deduplicate_targets(targets: Vec<ScrapeTarget>) -> Vec<ScrapeTarget> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
     use serde_json::json;
     use tokio::sync::mpsc;
 
     use super::{
-        DiscoveryData, ScrapeTarget, TargetIdentity, deduplicate_targets, pod_targets,
-        probe_targets, send_metric_chunks, service_targets, static_targets, targets_for_object,
+        DiscoveryData, ScrapeTarget, TargetIdentity, account_response_bytes, deduplicate_targets,
+        destination_explicitly_allowed, namespace_allowed, pod_targets, probe_targets,
+        send_metric_chunks, service_targets, static_targets, targets_for_object,
+        unsafe_destination_ip, validate_scrape_url,
     };
     use crate::remote_write::{CollectedMetric, MetricType};
     use crate::status::{MetricCardinality, StatusStore};
@@ -702,6 +1036,55 @@ mod tests {
             namespace: "monitoring".into(),
             name: "monitor".into(),
         }
+    }
+
+    #[test]
+    fn destination_policy_blocks_sensitive_network_ranges() {
+        for ip in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
+            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            "fe80::1".parse().unwrap(),
+        ] {
+            assert!(unsafe_destination_ip(ip), "{ip} must be blocked");
+        }
+        assert!(!unsafe_destination_ip("10.0.0.20".parse().unwrap()));
+    }
+
+    #[test]
+    fn explicit_destination_and_namespace_allowlists_are_exact() {
+        let destinations = vec!["metadata.test".into(), "*.trusted.example".into()];
+        assert!(destination_explicitly_allowed(
+            "metadata.test",
+            &destinations
+        ));
+        assert!(destination_explicitly_allowed(
+            "app.trusted.example",
+            &destinations
+        ));
+        assert!(!destination_explicitly_allowed(
+            "trusted.example",
+            &destinations
+        ));
+        assert!(!destination_explicitly_allowed(
+            "eviltrusted.example",
+            &destinations
+        ));
+        assert!(namespace_allowed("monitoring", &[]));
+        assert!(namespace_allowed("monitoring", &["monitoring".into()]));
+        assert!(!namespace_allowed("default", &["monitoring".into()]));
+    }
+
+    #[test]
+    fn scrape_url_validation_rejects_credentials_fragments_and_local_targets() {
+        assert!(validate_scrape_url("file:///etc/passwd", &[]).is_err());
+        assert!(validate_scrape_url("http://user:secret@example.com/metrics", &[]).is_err());
+        assert!(validate_scrape_url("http://example.com/metrics#secret", &[]).is_err());
+        assert!(validate_scrape_url("http://127.0.0.1:9090/metrics", &[]).is_err());
+        assert!(
+            validate_scrape_url("http://127.0.0.1:9090/metrics", &["127.0.0.1".into()]).is_ok()
+        );
     }
 
     fn discovery_data() -> DiscoveryData {
@@ -879,6 +1262,16 @@ mod tests {
         let result = deduplicate_targets(vec![first, second]);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].labels[0].1, "first");
+    }
+
+    #[test]
+    fn response_byte_accounting_never_exceeds_the_configured_limit() {
+        let mut total = 0;
+        account_response_bytes(&mut total, 4, 8).unwrap();
+        account_response_bytes(&mut total, 4, 8).unwrap();
+        assert_eq!(total, 8);
+        assert!(account_response_bytes(&mut total, 1, 8).is_err());
+        assert_eq!(total, 8);
     }
 
     #[tokio::test]

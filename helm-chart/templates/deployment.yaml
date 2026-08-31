@@ -55,6 +55,21 @@ spec:
             - --scrape-enabled={{ .Values.scrape.enabled }}
             - --scrape-interval={{ .Values.scrape.interval }}
             - --scrape-timeout={{ .Values.scrape.timeout }}
+            - --scrape-discovery-refresh-interval={{ .Values.scrape.discoveryRefreshInterval }}
+            - --scrape-concurrency={{ .Values.scrape.concurrency | int }}
+            - --scrape-max-response-bytes={{ .Values.scrape.maxResponseBytes | int }}
+            - --scrape-max-samples-per-target={{ .Values.scrape.maxSamplesPerTarget | int }}
+            - --scrape-max-labels-per-sample={{ .Values.scrape.maxLabelsPerSample | int }}
+            - --scrape-max-label-name-bytes={{ .Values.scrape.maxLabelNameBytes | int }}
+            - --scrape-max-label-value-bytes={{ .Values.scrape.maxLabelValueBytes | int }}
+            - --scrape-max-metric-name-bytes={{ .Values.scrape.maxMetricNameBytes | int }}
+            - --scrape-max-line-bytes={{ .Values.scrape.maxLineBytes | int }}
+            {{- if .Values.scrape.allowedNamespaces }}
+            - --scrape-allowed-namespaces={{ join "," .Values.scrape.allowedNamespaces }}
+            {{- end }}
+            {{- if .Values.scrape.allowedDestinations }}
+            - --scrape-allowed-destinations={{ join "," .Values.scrape.allowedDestinations }}
+            {{- end }}
           env:
             - name: METRICS_AGENT_UI_ENABLED
               value: {{ .Values.ui.enabled | quote }}
@@ -72,6 +87,10 @@ spec:
               value: {{ .Values.rushRemoteWrite.url | quote }}
             - name: RUSH_REMOTE_WRITE_INTERVAL
               value: {{ .Values.rushRemoteWrite.interval | quote }}
+            - name: RUSH_REMOTE_WRITE_TIMEOUT
+              value: {{ .Values.rushRemoteWrite.timeout | quote }}
+            - name: RUSH_REMOTE_WRITE_CONNECT_TIMEOUT
+              value: {{ .Values.rushRemoteWrite.connectTimeout | quote }}
             {{- if .Values.rushRemoteWrite.tenant }}
             - name: RUSH_REMOTE_WRITE_TENANT
               value: {{ .Values.rushRemoteWrite.tenant | quote }}

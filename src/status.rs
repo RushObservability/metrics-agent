@@ -50,6 +50,9 @@ pub struct ScrapeStatus {
     pub healthy_targets: u64,
     pub samples: u64,
     pub errors: u64,
+    pub duration_ms: u64,
+    pub discovery_duration_ms: u64,
+    pub discovery_cache_hit: bool,
     pub last_scrape_at: Option<String>,
     pub last_error: Option<String>,
 }
@@ -87,6 +90,7 @@ pub struct RemoteWriteStatus {
     pub last_publish_at: Option<String>,
     pub last_series: Option<u64>,
     pub last_samples: Option<u64>,
+    pub last_duration_ms: Option<u64>,
     pub last_error: Option<String>,
 }
 
@@ -227,6 +231,7 @@ impl StatusStore {
                     last_publish_at: None,
                     last_series: None,
                     last_samples: None,
+                    last_duration_ms: None,
                     last_error: None,
                 },
                 scrape: ScrapeStatus::default(),
@@ -389,12 +394,14 @@ impl StatusStore {
         series: Option<u64>,
         samples: Option<u64>,
         timestamp: String,
+        duration_ms: u64,
         error: Option<String>,
     ) {
         let mut state = self.mutable.write().await;
         state.remote_write.last_series = series;
         state.remote_write.last_samples = samples;
         state.remote_write.last_publish_at = Some(timestamp);
+        state.remote_write.last_duration_ms = Some(duration_ms);
         state.remote_write.last_error = error;
     }
 
@@ -676,6 +683,7 @@ mod tests {
                 None,
                 None,
                 "2026-07-25T00:00:00Z".into(),
+                125,
                 Some("connection refused".into()),
             )
             .await;
@@ -699,6 +707,9 @@ mod tests {
                 healthy_targets: 1,
                 samples: 0,
                 errors: 1,
+                duration_ms: 10_000,
+                discovery_duration_ms: 125,
+                discovery_cache_hit: true,
                 last_scrape_at: Some("2026-07-25T00:00:00Z".into()),
                 last_error: Some("target timed out".into()),
             })

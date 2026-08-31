@@ -36,9 +36,13 @@ async fn main() -> Result<()> {
         let tenant = config.rush_remote_write_tenant.clone();
         let extra_labels = config.extra_labels.clone();
         let interval = config.rush_remote_write_interval;
+        let client = reqwest::Client::builder()
+            .connect_timeout(config.rush_remote_write_connect_timeout)
+            .timeout(config.rush_remote_write_timeout)
+            .build()?;
         let shutdown = shutdown.clone();
         tokio::spawn(remote_write::run(
-            reqwest::Client::new(),
+            client,
             status,
             scrape_receiver,
             config

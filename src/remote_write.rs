@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
 use prost::Message;
 use reqwest::header::{CONTENT_ENCODING, CONTENT_TYPE};
@@ -70,6 +70,31 @@ pub struct CollectedMetric {
     pub metric_type: MetricType,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ScrapeLimits {
+    pub max_response_bytes: usize,
+    pub max_samples_per_target: usize,
+    pub max_labels_per_sample: usize,
+    pub max_label_name_bytes: usize,
+    pub max_label_value_bytes: usize,
+    pub max_metric_name_bytes: usize,
+    pub max_line_bytes: usize,
+}
+
+impl Default for ScrapeLimits {
+    fn default() -> Self {
+        Self {
+            max_response_bytes: 4_194_304,
+            max_samples_per_target: 50_000,
+            max_labels_per_sample: 64,
+            max_label_name_bytes: 256,
+            max_label_value_bytes: 4_096,
+            max_metric_name_bytes: 1_024,
+            max_line_bytes: 65_536,
+        }
+    }
+}
+
 /// Bounded scrape-to-write messages. Keeping the samples in the channel
 /// instead of a shared whole-cycle vector prevents the agent from retaining
 /// an entire scrape's worth of parsed samples between publishes.
@@ -107,8 +132,8 @@ pub async fn publish(
     publish_inner(
         client,
         url,
-        snapshot,
-        scraped,
+        Some(snapshot),
+        scraped.to_vec(),
         PublishOptions {
             token,
             tenant,
@@ -129,19 +154,22 @@ struct PublishOptions<'a> {
 async fn publish_inner(
     client: &reqwest::Client,
     url: &str,
-    snapshot: &StatusSnapshot,
-    scraped: &[CollectedMetric],
+    snapshot: Option<&StatusSnapshot>,
+    scraped: Vec<CollectedMetric>,
     options: PublishOptions<'_>,
 ) -> Result<PublishResult> {
-    let payload = encode(
-        snapshot,
-        scraped,
-        options.extra_labels,
-        options.include_self,
-    )?;
-    let compressed = snap::raw::Encoder::new()
-        .compress_vec(&payload.bytes)
-        .context("compress remote-write payload")?;
+    let snapshot = snapshot.cloned();
+    let extra_labels = options.extra_labels.clone();
+    let include_self = options.include_self;
+    let (payload, compressed) = tokio::task::spawn_blocking(move || {
+        let payload = encode(snapshot.as_ref(), &scraped, &extra_labels, include_self)?;
+        let compressed = snap::raw::Encoder::new()
+            .compress_vec(&payload.bytes)
+            .context("compress remote-write payload")?;
+        Ok::<_, anyhow::Error>((payload, compressed))
+    })
+    .await
+    .context("join remote-write encoding task")??;
 
     let mut request = client
         .post(url)
@@ -158,11 +186,7 @@ async fn publish_inner(
     let response = request.send().await.context("send remote-write payload")?;
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(anyhow!(
-            "Rush rejected remote-write payload: HTTP {status} {}",
-            body.chars().take(240).collect::<String>()
-        ));
+        return Err(anyhow!("Rush rejected remote-write payload: HTTP {status}"));
     }
 
     Ok(PublishResult {
@@ -178,17 +202,18 @@ struct EncodedPayload {
 }
 
 fn encode(
-    snapshot: &StatusSnapshot,
+    snapshot: Option<&StatusSnapshot>,
     scraped: &[CollectedMetric],
     extra_labels: &BTreeMap<String, String>,
     include_self: bool,
 ) -> Result<EncodedPayload> {
-    let exposition = metrics::render(snapshot);
     let mut helps = HashMap::new();
     let mut types = HashMap::new();
     let mut series = Vec::new();
 
     if include_self {
+        let snapshot = snapshot.context("self metrics require a status snapshot")?;
+        let exposition = metrics::render(snapshot);
         for line in exposition.lines() {
             if let Some(help) = line.strip_prefix("# HELP ") {
                 let mut fields = help.splitn(2, ' ');
@@ -341,70 +366,173 @@ pub fn parse_prometheus_text(
     body: &str,
     target_labels: &[(String, String)],
     default_timestamp: i64,
-) -> Vec<CollectedMetric> {
-    let mut helps = HashMap::new();
-    let mut types = HashMap::new();
-    let mut samples = Vec::new();
+    limits: ScrapeLimits,
+) -> Result<Vec<CollectedMetric>> {
+    let mut parser = PrometheusTextParser::new(target_labels, default_timestamp, limits)?;
     for line in body.lines() {
+        parser.push_line(line)?;
+    }
+    Ok(parser.finish())
+}
+
+/// Incremental Prometheus text parser used by the HTTP scraper. It retains
+/// parsed samples and metadata, but never the complete response body.
+pub struct PrometheusTextParser {
+    target_labels: Vec<(String, String)>,
+    default_timestamp: i64,
+    limits: ScrapeLimits,
+    helps: HashMap<String, String>,
+    types: HashMap<String, i32>,
+    samples: Vec<CollectedMetric>,
+}
+
+impl PrometheusTextParser {
+    pub fn new(
+        target_labels: &[(String, String)],
+        default_timestamp: i64,
+        limits: ScrapeLimits,
+    ) -> Result<Self> {
+        validate_target_labels(target_labels, limits)?;
+        Ok(Self {
+            target_labels: target_labels.to_vec(),
+            default_timestamp,
+            limits,
+            helps: HashMap::new(),
+            types: HashMap::new(),
+            samples: Vec::new(),
+        })
+    }
+
+    pub fn push_line(&mut self, line: &str) -> Result<()> {
+        if line.len() > self.limits.max_line_bytes {
+            bail!("Prometheus exposition line exceeds the configured byte limit");
+        }
         if let Some(help) = line.strip_prefix("# HELP ") {
             let mut fields = help.splitn(2, ' ');
             if let (Some(name), Some(description)) = (fields.next(), fields.next()) {
-                helps.insert(name.to_string(), description.to_string());
+                validate_metric_name(name, self.limits)?;
+                if description.len() > self.limits.max_label_value_bytes {
+                    bail!("Prometheus HELP text exceeds the configured byte limit");
+                }
+                self.helps.insert(name.to_string(), description.to_string());
             }
-            continue;
+            return Ok(());
         }
         if let Some(kind) = line.strip_prefix("# TYPE ") {
             let mut fields = kind.split_whitespace();
             if let (Some(name), Some(kind)) = (fields.next(), fields.next()) {
-                types.insert(name.to_string(), metric_type(kind));
+                validate_metric_name(name, self.limits)?;
+                self.types.insert(name.to_string(), metric_type(kind));
             }
-            continue;
+            return Ok(());
         }
         if line.starts_with('#') || line.trim().is_empty() {
-            continue;
+            return Ok(());
         }
         let Some((metric, raw_value)) = line.split_once(char::is_whitespace) else {
-            continue;
+            return Ok(());
         };
         let mut fields = raw_value.split_whitespace();
         let Ok(value) = fields.next().unwrap_or_default().parse::<f64>() else {
-            continue;
+            return Ok(());
         };
         if !value.is_finite() {
-            continue;
+            return Ok(());
         }
         let timestamp = fields
             .next()
             .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(default_timestamp);
-        let Ok((name, labels)) = parse_metric(metric) else {
-            continue;
-        };
-        let mut merged = target_labels.to_vec();
+            .unwrap_or(self.default_timestamp);
+        let (name, labels) = parse_metric_bounded(metric, self.limits)?;
+        if self.samples.len() >= self.limits.max_samples_per_target {
+            bail!("scrape target exceeds the configured sample limit");
+        }
+        let mut merged = self.target_labels.clone();
         for label in labels {
             if let Some(existing) = merged.iter_mut().find(|(key, _)| key == &label.name) {
                 existing.1 = label.value;
             } else {
+                if merged.len() >= self.limits.max_labels_per_sample {
+                    bail!("Prometheus sample exceeds the configured label-count limit");
+                }
                 merged.push((label.name, label.value));
             }
         }
-        samples.push(CollectedMetric {
+        self.samples.push(CollectedMetric {
             name: name.to_string(),
             labels: merged,
             value,
             timestamp,
-            help: helps.get(name).cloned().unwrap_or_default(),
-            metric_type: types
-                .get(name)
+            help: String::new(),
+            metric_type: MetricType::Gauge,
+        });
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Vec<CollectedMetric> {
+        for sample in &mut self.samples {
+            sample.help = self.helps.get(&sample.name).cloned().unwrap_or_default();
+            sample.metric_type = self
+                .types
+                .get(&sample.name)
                 .copied()
                 .and_then(|value| MetricType::try_from(value).ok())
-                .unwrap_or(MetricType::Gauge),
-        });
+                .unwrap_or(MetricType::Gauge);
+        }
+        self.samples
     }
-    samples
+}
+
+fn validate_target_labels(target_labels: &[(String, String)], limits: ScrapeLimits) -> Result<()> {
+    if target_labels.len() > limits.max_labels_per_sample {
+        bail!("scrape target labels exceed the configured label-count limit");
+    }
+    for (name, value) in target_labels {
+        if name.len() > limits.max_label_name_bytes {
+            bail!("scrape target label name exceeds the configured byte limit");
+        }
+        if value.len() > limits.max_label_value_bytes {
+            bail!("scrape target label value exceeds the configured byte limit");
+        }
+    }
+    Ok(())
+}
+
+fn validate_metric_name(name: &str, limits: ScrapeLimits) -> Result<()> {
+    if name.is_empty() {
+        bail!("Prometheus metric name is empty");
+    }
+    if name.len() > limits.max_metric_name_bytes {
+        bail!("Prometheus metric name exceeds the configured byte limit");
+    }
+    Ok(())
+}
+
+fn parse_metric_bounded(metric: &str, limits: ScrapeLimits) -> Result<(&str, Vec<Label>)> {
+    let Some((name, raw_labels)) = metric.split_once('{') else {
+        validate_metric_name(metric, limits)?;
+        return Ok((metric, Vec::new()));
+    };
+    validate_metric_name(name, limits)?;
+    let raw_labels = raw_labels
+        .strip_suffix('}')
+        .context("Prometheus metric labels are missing a closing brace")?;
+    Ok((name, parse_labels_bounded(raw_labels, limits)?))
 }
 
 fn parse_labels(raw: &str) -> Result<Vec<Label>> {
+    parse_labels_bounded(
+        raw,
+        ScrapeLimits {
+            max_labels_per_sample: usize::MAX,
+            max_label_name_bytes: usize::MAX,
+            max_label_value_bytes: usize::MAX,
+            ..ScrapeLimits::default()
+        },
+    )
+}
+
+fn parse_labels_bounded(raw: &str, limits: ScrapeLimits) -> Result<Vec<Label>> {
     if raw.is_empty() {
         return Ok(Vec::new());
     }
@@ -421,11 +549,14 @@ fn parse_labels(raw: &str) -> Result<Vec<Label>> {
         }
         let key = raw[key_start..cursor].trim();
         if key.is_empty() || cursor >= bytes.len() {
-            return Err(anyhow!("invalid Prometheus label set {raw:?}"));
+            return Err(anyhow!("invalid Prometheus label set"));
+        }
+        if key.len() > limits.max_label_name_bytes {
+            bail!("Prometheus label name exceeds the configured byte limit");
         }
         cursor += 1;
         if bytes.get(cursor) != Some(&b'\"') {
-            return Err(anyhow!("Prometheus label {key:?} is not quoted"));
+            return Err(anyhow!("Prometheus label value is not quoted"));
         }
         cursor += 1;
         let mut value = String::new();
@@ -439,22 +570,32 @@ fn parse_labels(raw: &str) -> Result<Vec<Label>> {
                 }
                 b'\\' if cursor + 1 < bytes.len() => {
                     cursor += 1;
-                    value.push(match bytes[cursor] {
+                    let character = match bytes[cursor] {
                         b'n' => '\n',
                         b'\\' => '\\',
                         b'\"' => '\"',
                         other => other as char,
-                    });
+                    };
+                    if value.len() + character.len_utf8() > limits.max_label_value_bytes {
+                        bail!("Prometheus label value exceeds the configured byte limit");
+                    }
+                    value.push(character);
                     cursor += 1;
                 }
                 byte => {
+                    if value.len() + (byte as char).len_utf8() > limits.max_label_value_bytes {
+                        bail!("Prometheus label value exceeds the configured byte limit");
+                    }
                     value.push(byte as char);
                     cursor += 1;
                 }
             }
         }
         if !closed {
-            return Err(anyhow!("Prometheus label {key:?} is not closed"));
+            return Err(anyhow!("Prometheus label value is not closed"));
+        }
+        if labels.len() >= limits.max_labels_per_sample {
+            bail!("Prometheus sample exceeds the configured label-count limit");
         }
         labels.push(Label {
             name: key.to_string(),
@@ -464,7 +605,7 @@ fn parse_labels(raw: &str) -> Result<Vec<Label>> {
             cursor += 1;
         }
         if cursor < bytes.len() && bytes[cursor] != b',' {
-            return Err(anyhow!("invalid separator in Prometheus label set {raw:?}"));
+            return Err(anyhow!("invalid separator in Prometheus label set"));
         }
         if bytes.get(cursor) == Some(&b',') {
             cursor += 1;
@@ -486,7 +627,9 @@ pub async fn run(
     shutdown: tokio_util::sync::CancellationToken,
 ) {
     let mut interval = tokio::time::interval(interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut cycle_active = false;
+    let mut cycle_started: Option<std::time::Instant> = None;
     let mut cycle_sent_self = false;
     let mut cycle_series = 0;
     let mut cycle_samples = 0;
@@ -499,6 +642,7 @@ pub async fn run(
                 match message {
                     ScrapeMessage::Start { .. } => {
                         cycle_active = true;
+                        cycle_started = Some(std::time::Instant::now());
                         cycle_sent_self = false;
                         cycle_series = 0;
                         cycle_samples = 0;
@@ -507,12 +651,16 @@ pub async fn run(
                     ScrapeMessage::Batch(metrics) => {
                         let Some(url) = url.as_deref() else { continue };
                         if cycle_error.is_some() { continue; }
-                        let snapshot = status.snapshot().await;
+                        let snapshot = if cycle_sent_self {
+                            None
+                        } else {
+                            Some(status.snapshot().await)
+                        };
                         match publish_inner(
                             &client,
                             url,
-                            &snapshot,
-                            &metrics,
+                            snapshot.as_ref(),
+                            metrics,
                             PublishOptions {
                                 token: token.as_deref(),
                                 tenant: tenant.as_deref(),
@@ -539,8 +687,8 @@ pub async fn run(
                                 match publish_inner(
                                     &client,
                                     url,
-                                    &snapshot,
-                                    &[],
+                                    Some(&snapshot),
+                                    Vec::new(),
                                     PublishOptions {
                                         token: token.as_deref(),
                                         tenant: tenant.as_deref(),
@@ -558,9 +706,13 @@ pub async fn run(
                             }
                         }
                         let timestamp = humantime::format_rfc3339_seconds(SystemTime::now()).to_string();
+                        let duration_ms = cycle_started
+                            .take()
+                            .map(|started| started.elapsed().as_millis() as u64)
+                            .unwrap_or(0);
                         match cycle_error.take() {
-                            None if url.is_some() => status.set_remote_write_result(Some(cycle_series), Some(cycle_samples), timestamp, None).await,
-                            Some(error) => status.set_remote_write_result(None, None, timestamp, Some(error.to_string())).await,
+                            None if url.is_some() => status.set_remote_write_result(Some(cycle_series), Some(cycle_samples), timestamp, duration_ms, None).await,
+                            Some(error) => status.set_remote_write_result(None, None, timestamp, duration_ms, Some(error.to_string())).await,
                             _ => {}
                         }
                         cycle_active = false;
@@ -579,11 +731,12 @@ pub async fn run(
                             continue;
                         }
                         let timestamp = humantime::format_rfc3339_seconds(SystemTime::now()).to_string();
+                        let started = std::time::Instant::now();
                         match publish_inner(
                             &client,
                             url,
-                            &snapshot,
-                            &[],
+                            Some(&snapshot),
+                            Vec::new(),
                             PublishOptions {
                                 token: token.as_deref(),
                                 tenant: tenant.as_deref(),
@@ -591,8 +744,8 @@ pub async fn run(
                                 include_self: true,
                             },
                         ).await {
-                            Ok(result) => status.set_remote_write_result(Some(result.series), Some(result.samples), timestamp, None).await,
-                            Err(error) => status.set_remote_write_result(None, None, timestamp, Some(error.to_string())).await,
+                            Ok(result) => status.set_remote_write_result(Some(result.series), Some(result.samples), timestamp, started.elapsed().as_millis() as u64, None).await,
+                            Err(error) => status.set_remote_write_result(None, None, timestamp, started.elapsed().as_millis() as u64, Some(error.to_string())).await,
                         }
                     }
                 }
@@ -608,7 +761,8 @@ mod tests {
     use prost::Message;
 
     use super::{
-        CollectedMetric, MetricType, WriteRequest, encode, parse_labels, parse_prometheus_text,
+        CollectedMetric, MetricType, PrometheusTextParser, ScrapeLimits, WriteRequest, encode,
+        parse_labels, parse_prometheus_text,
     };
     use crate::status::{
         CountersStatus, ProcessStatus, RemoteWriteStatus, ScrapeStatus, StatusSnapshot, Totals,
@@ -660,7 +814,9 @@ mod tests {
             "# HELP http_requests_total Requests.\n# TYPE http_requests_total counter\nhttp_requests_total{code=\"200\"} 7 1700000000123\n",
             &[("job".into(), "api".into())],
             1700000000000,
-        );
+            ScrapeLimits::default(),
+        )
+        .unwrap();
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].name, "http_requests_total");
         assert_eq!(samples[0].timestamp, 1700000000123);
@@ -686,7 +842,9 @@ request_total{job="scrape",path="a\\b\"c\n",code="200"} 3.5 1700000000123
                 ("cluster".into(), "prod".into()),
             ],
             1700000000000,
-        );
+            ScrapeLimits::default(),
+        )
+        .unwrap();
 
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].value, 3.5);
@@ -706,20 +864,31 @@ request_total{job="scrape",path="a\\b\"c\n",code="200"} 3.5 1700000000123
 
     #[test]
     fn uses_default_timestamp_and_ignores_malformed_or_special_values() {
-        let samples = parse_prometheus_text("good 1\n".to_owned().as_str(), &[], 42);
+        let samples = parse_prometheus_text(
+            "good 1\n".to_owned().as_str(),
+            &[],
+            42,
+            ScrapeLimits::default(),
+        )
+        .unwrap();
         assert_eq!(samples[0].timestamp, 42);
 
-        let samples = parse_prometheus_text("good 1\n".to_owned().as_str(), &[], 42);
+        let samples = parse_prometheus_text(
+            "good 1\n".to_owned().as_str(),
+            &[],
+            42,
+            ScrapeLimits::default(),
+        )
+        .unwrap();
         assert_eq!(samples.len(), 1);
 
         let body = "good 1\n".to_string()
             + "bad-not-a-sample\n"
-            + "bad{broken=\"label\" 2\n"
             + "nan NaN\n"
             + "plus_inf +Inf\n"
             + "minus_inf -Inf\n"
             + "also_good 2 100\n";
-        let samples = parse_prometheus_text(&body, &[], 42);
+        let samples = parse_prometheus_text(&body, &[], 42, ScrapeLimits::default()).unwrap();
         assert_eq!(samples.len(), 2);
         assert_eq!(samples[0].name, "good");
         assert_eq!(samples[1].name, "also_good");
@@ -735,6 +904,73 @@ request_total{job="scrape",path="a\\b\"c\n",code="200"} 3.5 1700000000123
     }
 
     #[test]
+    fn scrape_parser_enforces_sample_and_label_limits() {
+        let limits = ScrapeLimits {
+            max_samples_per_target: 1,
+            ..ScrapeLimits::default()
+        };
+        assert!(parse_prometheus_text("a 1\nb 2\n", &[], 42, limits).is_err());
+
+        let limits = ScrapeLimits {
+            max_labels_per_sample: 2,
+            ..ScrapeLimits::default()
+        };
+        assert!(
+            parse_prometheus_text(
+                "a{one=\"1\",two=\"2\"} 1\n",
+                &[("target".into(), "value".into())],
+                42,
+                limits,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn scrape_parser_enforces_name_value_and_line_limits() {
+        let name_limits = ScrapeLimits {
+            max_metric_name_bytes: 3,
+            ..ScrapeLimits::default()
+        };
+        assert!(parse_prometheus_text("long 1\n", &[], 42, name_limits).is_err());
+
+        let label_name_limits = ScrapeLimits {
+            max_label_name_bytes: 3,
+            ..ScrapeLimits::default()
+        };
+        assert!(parse_prometheus_text("ok{long=\"v\"} 1\n", &[], 42, label_name_limits,).is_err());
+
+        let label_value_limits = ScrapeLimits {
+            max_label_value_bytes: 3,
+            ..ScrapeLimits::default()
+        };
+        assert!(
+            parse_prometheus_text("ok{key=\"long\"} 1\n", &[], 42, label_value_limits,).is_err()
+        );
+
+        let line_limits = ScrapeLimits {
+            max_line_bytes: 4,
+            ..ScrapeLimits::default()
+        };
+        assert!(parse_prometheus_text("metric 1\n", &[], 42, line_limits).is_err());
+    }
+
+    #[test]
+    fn incremental_scrape_parser_applies_metadata_at_finish() {
+        let mut parser =
+            PrometheusTextParser::new(&[("job".into(), "api".into())], 42, ScrapeLimits::default())
+                .unwrap();
+        parser.push_line("requests_total 3").unwrap();
+        parser.push_line("# HELP requests_total Requests.").unwrap();
+        parser.push_line("# TYPE requests_total counter").unwrap();
+        let samples = parser.finish();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].help, "Requests.");
+        assert_eq!(samples[0].metric_type, MetricType::Counter);
+        assert_eq!(samples[0].labels, vec![("job".into(), "api".into())]);
+    }
+
+    #[test]
     fn encodes_protobuf_with_sorted_merged_labels_and_metadata() {
         let metric = CollectedMetric {
             name: "http_requests_total".into(),
@@ -744,7 +980,7 @@ request_total{job="scrape",path="a\\b\"c\n",code="200"} 3.5 1700000000123
             help: "Total requests.".into(),
             metric_type: MetricType::Counter,
         };
-        let encoded = encode(&snapshot(), &[metric], &BTreeMap::new(), false).unwrap();
+        let encoded = encode(None, &[metric], &BTreeMap::new(), false).unwrap();
         assert_eq!(encoded.series, 1);
         assert_eq!(encoded.samples, 1);
 
@@ -780,7 +1016,7 @@ request_total{job="scrape",path="a\\b\"c\n",code="200"} 3.5 1700000000123
             help: String::new(),
             metric_type: MetricType::Gauge,
         };
-        let encoded = encode(&snapshot(), &[metric], &BTreeMap::new(), false).unwrap();
+        let encoded = encode(None, &[metric], &BTreeMap::new(), false).unwrap();
         let compressed = snap::raw::Encoder::new()
             .compress_vec(&encoded.bytes)
             .unwrap();
@@ -794,7 +1030,8 @@ request_total{job="scrape",path="a\\b\"c\n",code="200"} 3.5 1700000000123
 
     #[test]
     fn self_metrics_add_reserved_name_and_default_labels() {
-        let encoded = encode(&snapshot(), &[], &BTreeMap::new(), true).unwrap();
+        let snapshot = snapshot();
+        let encoded = encode(Some(&snapshot), &[], &BTreeMap::new(), true).unwrap();
         let request = WriteRequest::decode(encoded.bytes.as_slice()).unwrap();
         let ready = request
             .timeseries
@@ -834,7 +1071,8 @@ request_total{job="scrape",path="a\\b\"c\n",code="200"} 3.5 1700000000123
             ("cluster".to_string(), "ntt-japan".to_string()),
             ("env".to_string(), "dev".to_string()),
         ]);
-        let encoded = encode(&snapshot(), &[metric], &extra_labels, true).unwrap();
+        let snapshot = snapshot();
+        let encoded = encode(Some(&snapshot), &[metric], &extra_labels, true).unwrap();
         let request = WriteRequest::decode(encoded.bytes.as_slice()).unwrap();
 
         assert!(!request.timeseries.is_empty());
