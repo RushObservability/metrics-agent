@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -278,6 +278,7 @@ fn encode(
         let mut labels = metric
             .labels
             .iter()
+            .filter(|(name, _)| name != "__name__")
             .map(|(name, value)| Label {
                 name: name.clone(),
                 value: value.clone(),
@@ -487,7 +488,11 @@ fn validate_target_labels(target_labels: &[(String, String)], limits: ScrapeLimi
     if target_labels.len() > limits.max_labels_per_sample {
         bail!("scrape target labels exceed the configured label-count limit");
     }
+    let mut names = HashSet::with_capacity(target_labels.len());
     for (name, value) in target_labels {
+        if !names.insert(name) {
+            bail!("scrape target labels contain a duplicate name");
+        }
         if name.len() > limits.max_label_name_bytes {
             bail!("scrape target label name exceeds the configured byte limit");
         }
@@ -539,6 +544,7 @@ fn parse_labels_bounded(raw: &str, limits: ScrapeLimits) -> Result<Vec<Label>> {
     let bytes = raw.as_bytes();
     let mut cursor = 0;
     let mut labels = Vec::new();
+    let mut names = HashSet::new();
     while cursor < bytes.len() {
         while bytes.get(cursor) == Some(&b',') || bytes.get(cursor) == Some(&b' ') {
             cursor += 1;
@@ -554,6 +560,9 @@ fn parse_labels_bounded(raw: &str, limits: ScrapeLimits) -> Result<Vec<Label>> {
         if key.len() > limits.max_label_name_bytes {
             bail!("Prometheus label name exceeds the configured byte limit");
         }
+        if !names.insert(key) {
+            bail!("Prometheus sample contains a duplicate label name");
+        }
         cursor += 1;
         if bytes.get(cursor) != Some(&b'\"') {
             return Err(anyhow!("Prometheus label value is not quoted"));
@@ -568,13 +577,16 @@ fn parse_labels_bounded(raw: &str, limits: ScrapeLimits) -> Result<Vec<Label>> {
                     closed = true;
                     break;
                 }
-                b'\\' if cursor + 1 < bytes.len() => {
+                b'\\' => {
+                    if cursor + 1 >= bytes.len() {
+                        bail!("Prometheus label value contains an invalid escape");
+                    }
                     cursor += 1;
                     let character = match bytes[cursor] {
                         b'n' => '\n',
                         b'\\' => '\\',
                         b'\"' => '\"',
-                        other => other as char,
+                        _ => bail!("Prometheus label value contains an invalid escape"),
                     };
                     if value.len() + character.len_utf8() > limits.max_label_value_bytes {
                         bail!("Prometheus label value exceeds the configured byte limit");
@@ -582,12 +594,16 @@ fn parse_labels_bounded(raw: &str, limits: ScrapeLimits) -> Result<Vec<Label>> {
                     value.push(character);
                     cursor += 1;
                 }
-                byte => {
-                    if value.len() + (byte as char).len_utf8() > limits.max_label_value_bytes {
+                _ => {
+                    let character = raw[cursor..]
+                        .chars()
+                        .next()
+                        .context("invalid UTF-8 boundary in Prometheus label value")?;
+                    if value.len() + character.len_utf8() > limits.max_label_value_bytes {
                         bail!("Prometheus label value exceeds the configured byte limit");
                     }
-                    value.push(byte as char);
-                    cursor += 1;
+                    value.push(character);
+                    cursor += character.len_utf8();
                 }
             }
         }
@@ -904,6 +920,29 @@ request_total{job="scrape",path="a\\b\"c\n",code="200"} 3.5 1700000000123
     }
 
     #[test]
+    fn preserves_unicode_label_values() {
+        let labels = parse_labels("city=\"Montréal\",team=\"東京\"").unwrap();
+        assert_eq!(labels[0].value, "Montréal");
+        assert_eq!(labels[1].value, "東京");
+    }
+
+    #[test]
+    fn rejects_invalid_escapes_and_duplicate_sample_labels() {
+        assert!(parse_labels(r#"path="bad\tvalue""#).is_err());
+        assert!(parse_labels(r#"env="dev",env="prod""#).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_target_labels() {
+        let result = PrometheusTextParser::new(
+            &[("env".into(), "dev".into()), ("env".into(), "prod".into())],
+            42,
+            ScrapeLimits::default(),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn scrape_parser_enforces_sample_and_label_limits() {
         let limits = ScrapeLimits {
             max_samples_per_target: 1,
@@ -1004,6 +1043,50 @@ request_total{job="scrape",path="a\\b\"c\n",code="200"} 3.5 1700000000123
         assert_eq!(request.timeseries[0].labels[0].value, "http_requests_total");
         assert_eq!(request.timeseries[0].samples[0].value, 9.5);
         assert_eq!(request.timeseries[0].samples[0].timestamp, 1700000000123);
+    }
+
+    #[test]
+    fn encoder_keeps_only_the_canonical_metric_name_label() {
+        let metric = CollectedMetric {
+            name: "requests_total".into(),
+            labels: vec![("__name__".into(), "spoofed_name".into())],
+            value: 1.0,
+            timestamp: 42,
+            help: String::new(),
+            metric_type: MetricType::Counter,
+        };
+        let encoded = encode(None, &[metric], &BTreeMap::new(), false).unwrap();
+        let request = WriteRequest::decode(encoded.bytes.as_slice()).unwrap();
+        let name_labels = request.timeseries[0]
+            .labels
+            .iter()
+            .filter(|label| label.name == "__name__")
+            .collect::<Vec<_>>();
+        assert_eq!(name_labels.len(), 1);
+        assert_eq!(name_labels[0].value, "requests_total");
+    }
+
+    #[test]
+    fn encoder_emits_one_metadata_record_per_metric_family() {
+        let metrics = [1.0, 2.0].map(|value| CollectedMetric {
+            name: "queue_depth".into(),
+            labels: vec![("worker".into(), value.to_string())],
+            value,
+            timestamp: 42,
+            help: "Queued work.".into(),
+            metric_type: MetricType::Gauge,
+        });
+        let encoded = encode(None, &metrics, &BTreeMap::new(), false).unwrap();
+        let request = WriteRequest::decode(encoded.bytes.as_slice()).unwrap();
+        assert_eq!(request.timeseries.len(), 2);
+        assert_eq!(request.metadata.len(), 1);
+        assert_eq!(request.metadata[0].metric_family_name, "queue_depth");
+    }
+
+    #[test]
+    fn self_metrics_require_a_snapshot() {
+        let error = encode(None, &[], &BTreeMap::new(), true).err().unwrap();
+        assert!(error.to_string().contains("require a status snapshot"));
     }
 
     #[test]
