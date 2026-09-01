@@ -666,6 +666,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_cardinality_updates_do_not_lose_counts() {
+        let store = StatusStore::new("test", false, ":7070", "/ui/", None);
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let store = store.clone();
+            tasks.push(tokio::spawn(async move {
+                store
+                    .record_crd_metrics(
+                        "victoria:service-monitor:default/api".into(),
+                        "service-monitor".into(),
+                        "victoria".into(),
+                        "default".into(),
+                        "api".into(),
+                        2,
+                        [MetricCardinality {
+                            name: "requests_total".into(),
+                            series: 3,
+                        }],
+                    )
+                    .await;
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        let snapshot = store.snapshot().await;
+        let cardinality = &snapshot.crd_metric_cardinality[0];
+        assert_eq!(cardinality.samples, 64);
+        assert_eq!(cardinality.total_series, 96);
+        assert_eq!(cardinality.top_metrics[0].series, 96);
+    }
+
+    #[tokio::test]
     async fn redacts_remote_write_configuration_and_preserves_failure_state() {
         let store = StatusStore::new(
             "test",

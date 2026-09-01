@@ -446,43 +446,78 @@ async fn parse_bounded_response(
     {
         bail!("scrape response exceeds the configured byte limit");
     }
-    let mut parser = PrometheusTextParser::new(target_labels, default_timestamp, limits)?;
-    let mut pending = Vec::with_capacity(limits.max_line_bytes.min(8_192));
-    let mut total_bytes = 0usize;
+    let mut parser = BoundedTextParser::new(target_labels, default_timestamp, limits)?;
     let mut chunks = response.bytes_stream();
     while let Some(chunk) = chunks.next().await {
         let chunk = chunk.context("reading scrape response body")?;
-        account_response_bytes(&mut total_bytes, chunk.len(), limits.max_response_bytes)?;
-        pending.extend_from_slice(&chunk);
+        parser.push_chunk(&chunk)?;
+    }
+    parser.finish()
+}
+
+/// Keeps response framing and parser limits testable without opening a socket.
+struct BoundedTextParser {
+    parser: PrometheusTextParser,
+    pending: Vec<u8>,
+    total_bytes: usize,
+    limits: ScrapeLimits,
+}
+
+impl BoundedTextParser {
+    fn new(
+        target_labels: &[(String, String)],
+        default_timestamp: i64,
+        limits: ScrapeLimits,
+    ) -> Result<Self> {
+        Ok(Self {
+            parser: PrometheusTextParser::new(target_labels, default_timestamp, limits)?,
+            pending: Vec::with_capacity(limits.max_line_bytes.min(8_192)),
+            total_bytes: 0,
+            limits,
+        })
+    }
+
+    fn push_chunk(&mut self, chunk: &[u8]) -> Result<()> {
+        account_response_bytes(
+            &mut self.total_bytes,
+            chunk.len(),
+            self.limits.max_response_bytes,
+        )?;
+        self.pending.extend_from_slice(chunk);
 
         let mut consumed = 0usize;
-        for newline in pending
+        for newline in self
+            .pending
             .iter()
             .enumerate()
             .filter_map(|(index, byte)| (*byte == b'\n').then_some(index))
         {
-            let mut line = &pending[consumed..newline];
+            let mut line = &self.pending[consumed..newline];
             if line.last() == Some(&b'\r') {
                 line = &line[..line.len() - 1];
             }
-            parser.push_line(
+            self.parser.push_line(
                 std::str::from_utf8(line).context("scrape response is not valid UTF-8")?,
             )?;
             consumed = newline + 1;
         }
         if consumed > 0 {
-            pending.drain(..consumed);
+            self.pending.drain(..consumed);
         }
-        if pending.len() > limits.max_line_bytes {
+        if self.pending.len() > self.limits.max_line_bytes {
             bail!("Prometheus exposition line exceeds the configured byte limit");
         }
+        Ok(())
     }
-    if !pending.is_empty() {
-        parser.push_line(
-            std::str::from_utf8(&pending).context("scrape response is not valid UTF-8")?,
-        )?;
+
+    fn finish(mut self) -> Result<Vec<CollectedMetric>> {
+        if !self.pending.is_empty() {
+            self.parser.push_line(
+                std::str::from_utf8(&self.pending).context("scrape response is not valid UTF-8")?,
+            )?;
+        }
+        Ok(self.parser.finish())
     }
-    Ok(parser.finish())
 }
 
 fn account_response_bytes(total: &mut usize, chunk_bytes: usize, max_bytes: usize) -> Result<()> {
@@ -1016,12 +1051,12 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{
-        DiscoveryData, ScrapeTarget, TargetIdentity, account_response_bytes, deduplicate_targets,
-        destination_explicitly_allowed, namespace_allowed, pod_targets, probe_targets,
-        send_metric_chunks, service_targets, static_targets, targets_for_object,
+        BoundedTextParser, DiscoveryData, ScrapeTarget, TargetIdentity, account_response_bytes,
+        deduplicate_targets, destination_explicitly_allowed, namespace_allowed, pod_targets,
+        probe_targets, send_metric_chunks, service_targets, static_targets, targets_for_object,
         unsafe_destination_ip, validate_scrape_url,
     };
-    use crate::remote_write::{CollectedMetric, MetricType};
+    use crate::remote_write::{CollectedMetric, MetricType, ScrapeLimits};
     use crate::status::{MetricCardinality, StatusStore};
 
     fn object(value: serde_json::Value) -> kube::api::DynamicObject {
@@ -1274,6 +1309,69 @@ mod tests {
         assert_eq!(total, 8);
     }
 
+    #[test]
+    fn streaming_parser_handles_split_utf8_crlf_and_final_line() {
+        let body = "# TYPE temperature gauge\r\ntemperature{city=\"Montréal\"} 21\r\npressure 1013";
+        let split = body.find('é').unwrap() + 1;
+        let mut parser = BoundedTextParser::new(&[], 42, ScrapeLimits::default()).unwrap();
+        parser.push_chunk(&body.as_bytes()[..split]).unwrap();
+        parser
+            .push_chunk(&body.as_bytes()[split..split + 1])
+            .unwrap();
+        parser.push_chunk(&body.as_bytes()[split + 1..]).unwrap();
+
+        let metrics = parser.finish().unwrap();
+        assert_eq!(metrics.len(), 2);
+        assert_eq!(metrics[0].metric_type, MetricType::Gauge);
+        assert_eq!(metrics[0].labels[0].1, "Montréal");
+        assert_eq!(metrics[1].name, "pressure");
+        assert_eq!(metrics[1].timestamp, 42);
+    }
+
+    #[test]
+    fn streaming_parser_enforces_cumulative_body_limit() {
+        let limits = ScrapeLimits {
+            max_response_bytes: 8,
+            ..ScrapeLimits::default()
+        };
+        let mut parser = BoundedTextParser::new(&[], 42, limits).unwrap();
+        parser.push_chunk(b"a 1\n").unwrap();
+        parser.push_chunk(b"b 2\n").unwrap();
+        let error = parser.push_chunk(b"x").unwrap_err();
+        assert!(error.to_string().contains("response exceeds"));
+    }
+
+    #[test]
+    fn streaming_parser_rejects_overlong_unterminated_line() {
+        let limits = ScrapeLimits {
+            max_line_bytes: 4,
+            ..ScrapeLimits::default()
+        };
+        let mut parser = BoundedTextParser::new(&[], 42, limits).unwrap();
+        let error = parser.push_chunk(b"abcde").unwrap_err();
+        assert!(error.to_string().contains("line exceeds"));
+    }
+
+    #[test]
+    fn streaming_parser_rejects_invalid_utf8() {
+        let mut parser = BoundedTextParser::new(&[], 42, ScrapeLimits::default()).unwrap();
+        let error = parser
+            .push_chunk(&[b'a', b' ', b'1', 0xff, b'\n'])
+            .unwrap_err();
+        assert!(error.to_string().contains("not valid UTF-8"));
+    }
+
+    #[test]
+    fn streaming_parser_propagates_sample_limit_errors() {
+        let limits = ScrapeLimits {
+            max_samples_per_target: 1,
+            ..ScrapeLimits::default()
+        };
+        let mut parser = BoundedTextParser::new(&[], 42, limits).unwrap();
+        let error = parser.push_chunk(b"a 1\nb 2\n").unwrap_err();
+        assert!(error.to_string().contains("sample limit"));
+    }
+
     #[tokio::test]
     async fn sends_metrics_in_bounded_batches() {
         let metrics = (0..20_001)
@@ -1298,6 +1396,30 @@ mod tests {
         }
         assert_eq!(task.await.unwrap().unwrap(), 20_001);
         assert_eq!(sizes, vec![10_000, 10_000, 1]);
+    }
+
+    #[tokio::test]
+    async fn empty_metric_batch_sends_nothing() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        assert_eq!(send_metric_chunks(&sender, Vec::new()).await.unwrap(), 0);
+        drop(sender);
+        assert!(receiver.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn closed_remote_write_channel_stops_batching() {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let metric = CollectedMetric {
+            name: "up".into(),
+            labels: Vec::new(),
+            value: 1.0,
+            timestamp: 42,
+            help: String::new(),
+            metric_type: MetricType::Gauge,
+        };
+        let error = send_metric_chunks(&sender, vec![metric]).await.unwrap_err();
+        assert!(error.to_string().contains("channel closed"));
     }
 
     #[tokio::test]
