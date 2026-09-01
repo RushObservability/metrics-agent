@@ -297,10 +297,11 @@ Verify publishing from the agent status endpoint:
 
     curl http://localhost:7070/api/v1/status | jq .remote_write
 
-Then query Rush through query-api:
+Set `RUSH_API_KEY` to a tenant-scoped API key, then query Rush through
+query-api:
 
     curl -G http://localhost:8080/prom/api/v1/query \
-      -H 'Authorization: Bearer your_tenant_scoped_api_key' \
+      -H "Authorization: Bearer ${RUSH_API_KEY}" \
       --data-urlencode 'query=up'
 
 ## Operations and security
