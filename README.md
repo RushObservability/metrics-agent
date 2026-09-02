@@ -22,6 +22,8 @@ allowing converter-owned resources to follow their Prometheus source. It does
 the reconciliation and collection in one process, without deploying another
 Prometheus-compatible database.
 
+![metrics-agent status UI](docs/metrics-agent-ui.jpg)
+
 ## What it does
 
 **Reconciles scrape resources.** The controller watches `ServiceMonitor`,
@@ -118,7 +120,7 @@ same-named labels supplied by targets:
 ```yaml
 extraLabels:
   env: dev
-  cluster: ntt-japan
+  cluster: my-cluster
 ```
 
 The chart supports one replica. It rejects larger values until the controller
@@ -261,8 +263,6 @@ kubectl -n monitoring port-forward svc/metrics-agent 7070:7070
 open http://localhost:7070/ui/
 curl http://localhost:7070/api/v1/status | jq
 ```
-
-![metrics-agent status UI](docs/metrics-agent-ui.jpg)
 
 Per-object memory in the UI estimates serialized watch-cache data. It is not an
 operating-system allocation for that object.
