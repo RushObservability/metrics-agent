@@ -2,377 +2,334 @@
 
 # metrics-agent
 
-**Discover the scrape config. Preserve the right source. Ship the signal.**
+**Kubernetes scrape discovery and remote write for [Rush](https://github.com/RushObservability).**
 
 [![ci](https://github.com/RushObservability/metrics-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/RushObservability/metrics-agent/actions/workflows/ci.yml)
 [![release](https://github.com/RushObservability/metrics-agent/actions/workflows/release.yml/badge.svg)](https://github.com/RushObservability/metrics-agent/actions/workflows/release.yml)
+![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 
 </div>
 
-metrics-agent is a Kubernetes-native metrics collector for Rush. It watches
-Prometheus Operator and VictoriaMetrics scrape resources, resolves collisions
-between converted and native objects, scrapes discovered endpoints, and
-publishes samples directly to query-api through Prometheus remote write.
+metrics-agent is the Rust service that turns Prometheus Operator and
+VictoriaMetrics Operator scrape resources into metrics in Rush. It watches the
+Kubernetes API, resolves Services and Pods into scrape targets, reads
+Prometheus exposition, and sends the samples to query-api with Prometheus
+remote write.
 
-It also includes a small control surface for collection health, process resource
-usage, discovered CRDs, scrape status, and per-CRD metric cardinality.
-
-> metrics-agent is normally deployed as part of a [Rush](https://github.com/RushObservability)
-> installation. It publishes workload metrics directly to Rush.
-
-![metrics-agent control surface](docs/metrics-agent-ui.jpg)
-
-The embedded control surface gives operators a live view of CRD discovery,
-collection health, process resource usage, and Rush publishing.
-
-## Why use metrics-agent?
-
-Use metrics-agent when you want to discover and collect the scrape configuration
-already present in a Kubernetes cluster without installing a separate datasource.
-It understands Prometheus Operator and VictoriaMetrics Operator CRDs, resolves
-their targets, and sends the resulting
-metrics directly to Rush.
-
-This is useful when you want to:
-
-- inspect which Services, Pods, probes, and scrape configs are configured;
-- preserve native VictoriaMetrics configurations alongside Prometheus resources;
-- avoid deploying another metrics datasource just to collect existing targets;
-- send workload and collector-health metrics directly to a Rush tenant; and
-- see collection health, cardinality, and resource usage from the embedded UI.
+The two operators can describe the same target. That overlap is the awkward
+part. metrics-agent keeps native VictoriaMetrics resources in control while
+allowing converter-owned resources to follow their Prometheus source. It does
+the reconciliation and collection in one process, without deploying another
+Prometheus-compatible database.
 
 ## What it does
 
-**Discover.** Watches supported scrape CRDs and the Kubernetes Services,
-Endpoints, and Pods needed to resolve their targets.
+**Reconciles scrape resources.** The controller watches `ServiceMonitor`,
+`PodMonitor`, `Probe`, and `ScrapeConfig` alongside their VictoriaMetrics
+equivalents. It marks native VictoriaMetrics objects so the operator's
+Prometheus converter does not overwrite them.
 
-**Preserve precedence.** Keeps native VictoriaMetrics scrape objects from being
-overwritten by the Prometheus converter, while allowing converter-owned objects
-to follow their Prometheus source.
+**Discovers and scrapes targets.** Services, Endpoints, and Pods are resolved
+into HTTP targets. Scrapes run with fixed limits for concurrency, response
+bytes, line length, labels, and samples. One bad exporter fails its own scrape;
+it does not consume an unbounded amount of agent memory.
 
-**Collect.** Scrapes Prometheus exposition endpoints directly from the Rust
-process with bounded concurrency and bounded remote-write batches.
+**Writes directly to Rush.** Workload samples and the agent's own health
+metrics are sent to query-api in Snappy-compressed remote-write requests. The
+agent streams bounded batches instead of holding a complete scrape cycle in
+memory.
 
-**Publish.** Sends workload samples and agent health metrics to Rush's
-Prometheus-compatible remote-write endpoint with optional tenant and bearer
-token routing.
-
-**Inspect.** Always serves /livez, /readyz, and /metrics. The detailed JSON
-status endpoints and embedded UI at /ui/ are disabled unless you opt in.
-
-## How it works
-
-    Kubernetes API
-          │
-          ├── Prometheus scrape CRDs ──┐
-          └── VictoriaMetrics CRDs ───┤
-                                       ▼
-                             precedence controller
-                                       │
-                             target discovery + scrape
-                                       │
-                                       ▼
-                             Prometheus remote write
-                                       │
-                                       ▼
-                                  query-api → Rush
-
-The agent keeps the scrape pipeline in memory and streams samples in bounded
-batches. It does not retain an entire scrape cycle before publishing it.
-
-## Supported resources
-
-| Prometheus Operator | VictoriaMetrics Operator |
-| --- | --- |
-| ServiceMonitor | VMServiceScrape |
-| PodMonitor | VMPodScrape |
-| Probe | VMProbe |
-| ScrapeConfig | VMScrapeConfig |
-
-Rule and Alertmanager resources are excluded because they do not define scrape
-targets.
-
-## Precedence
-
-VictoriaMetrics Operator-created objects carry an owner reference to their
-same-name Prometheus object. metrics-agent uses that reference to distinguish
-converter-owned objects from native VictoriaMetrics objects:
-
-1. Converter-owned VM objects continue to follow Prometheus configuration.
-2. Native VM objects receive the
-   operator.victoriametrics.com/ignore-prometheus-updates: enabled annotation.
-3. A native VM object wins when Prometheus and VictoriaMetrics resources share
-   a name and namespace.
-
-For an exceptional migration, force a source with an annotation:
-
-    metadata:
-      annotations:
-        metrics-agent.rushobservability.com/prefer-source: victoriametrics
-
-The other accepted value is prometheus. Forcing victoriametrics also removes
-the matching Prometheus owner reference so the object cannot be garbage-collected
-with the Prometheus resource.
-
-## Requirements
-
-- Kubernetes 1.27 or newer
-- Helm 3
-- Prometheus Operator CRDs when Prometheus scrape resources are used
-- VictoriaMetrics Operator CRDs when VictoriaMetrics scrape resources are used
-
-Configure the VictoriaMetrics converter with owner references enabled:
-
-    operator:
-      disable_prometheus_converter: false
-      enable_converter_ownership: true
-
-The operator Deployment must have
-VM_ENABLEDPROMETHEUSCONVERTEROWNERREFERENCES=true so the controller can identify
-converted objects reliably.
+**Reports what it is doing.** Liveness, readiness, and Prometheus metrics are
+always available. An opt-in local UI adds target health, CRD inventory,
+cardinality, process use, and delivery status.
 
 ## Quick start
 
-Run the local test and verification gates:
+Run the tests, then start the agent against your current Kubernetes context.
+query-api must be listening on `localhost:8080`.
 
-    make test
-    make verify
+```bash
+make test
+make run
+```
 
-Run against the current Kubernetes context and publish to a local query-api on
-port 8080:
+`make run` uses these local defaults:
 
-    make run
+```text
+Remote write  http://localhost:8080/prom/api/v1/write
+Tenant        default
+HTTP          http://localhost:7070
+UI            disabled
+```
 
-The local default is:
+Use a different kubeconfig or Rush endpoint when needed:
 
-    remote write: http://localhost:8080/prom/api/v1/write
-    tenant:       default
-    HTTP/UI:      :7070
-    UI path:      /ui/
+```bash
+make run \
+  METRICS_AGENT_KUBECONFIG=/path/to/kubeconfig \
+  RUSH_REMOTE_WRITE_URL=http://localhost:8080/prom/api/v1/write \
+  RUSH_REMOTE_WRITE_TENANT=default
+```
 
-Override the destination when needed:
-
-    make run \
-      RUSH_REMOTE_WRITE_URL=http://localhost:8080/prom/api/v1/write \
-      RUSH_REMOTE_WRITE_TENANT=default
-
-Use METRICS_AGENT_KUBECONFIG=/path/to/config when the active kubeconfig is not
-the one to inspect.
+The process needs permission to list and watch the supported scrape resources,
+Services, Endpoints, and Pods. It also needs patch access to the supported
+VictoriaMetrics scrape resources when precedence reconciliation is enabled.
 
 ## Install with Helm
 
-Build and publish the image, or use a release image from GHCR:
+Install the chart from this repository with a published image:
 
-    helm upgrade --install metrics-agent ./helm-chart \
-      --namespace monitoring \
-      --create-namespace \
-      --set image.repository=ghcr.io/rushobservability/metrics-agent \
-      --set image.tag=0.1.0 \
-      --set rushRemoteWrite.enabled=true \
-      --set rushRemoteWrite.url=http://rush-query-api.monitoring.svc.cluster.local:8080/prom/api/v1/write
+```bash
+helm upgrade --install metrics-agent ./helm-chart \
+  --namespace monitoring \
+  --create-namespace \
+  --set image.repository=ghcr.io/rushobservability/metrics-agent \
+  --set image.tag=0.1.0 \
+  --set rushRemoteWrite.enabled=true \
+  --set rushRemoteWrite.url=http://rush-query-api.monitoring.svc.cluster.local:8080/prom/api/v1/write
+```
 
-For secured Rush ingestion, create an **ingest-only** API key scoped to the
-target tenant and the `metrics` signal. Keep that bearer token in a Kubernetes
-Secret rather than in Helm values:
+For a locked Rush tenant, create an ingest-only API key with the `metrics`
+signal. Put it in a Secret rather than a Helm value:
 
-    kubectl -n monitoring create secret generic rush-remote-write \
-      --from-literal=token=your_tenant_scoped_api_key
+```bash
+kubectl -n monitoring create secret generic rush-remote-write \
+  --from-literal=token="${RUSH_INGEST_API_KEY}"
+```
 
-    rushRemoteWrite:
-      enabled: true
-      url: http://rush-query-api.monitoring.svc.cluster.local:8080/prom/api/v1/write
-      bearerTokenSecret:
-        name: rush-remote-write
-        key: token
+Reference the Secret in your values file:
 
-For a tenant whose **Require ingest key** setting is off, omit the Secret and
-set `rushRemoteWrite.allowAnonymous: true`. Anonymous remote write is otherwise
-rejected by the chart and by Rush.
+```yaml
+rushRemoteWrite:
+  enabled: true
+  url: http://rush-query-api.monitoring.svc.cluster.local:8080/prom/api/v1/write
+  bearerTokenSecret:
+    name: rush-remote-write
+    key: token
+```
 
-Add deployment-wide labels to every outgoing series with top-level
-`extraLabels`. Configured values override same-named labels from scrape targets:
+If the tenant has **Require ingest key** turned off, omit the Secret and set
+`rushRemoteWrite.allowAnonymous: true`. The chart rejects an unauthenticated
+configuration unless that value is explicit.
 
-    extraLabels:
-      env: dev
+Add labels to every outgoing series with `extraLabels`. These values replace
+same-named labels supplied by targets:
 
-The final image uses a Chainguard Rust builder and glibc-dynamic runtime. It
-runs as UID 65532, has no shell or package manager, and uses a read-only
-filesystem with Linux capabilities dropped.
+```yaml
+extraLabels:
+  env: dev
+  cluster: ntt-japan
+```
 
-For a security-focused installation, start with
-examples/values-secure.yaml. Pin image.digest to a release digest and replace
-the example NetworkPolicy egress rules with the exact Kubernetes API-server,
-DNS, scrape-target, and Rush/query-api destinations for your cluster.
+The chart supports one replica. It rejects larger values until the controller
+has leader election. For a locked-down starting point, use
+[`examples/values-secure.yaml`](examples/values-secure.yaml) and replace its
+example NetworkPolicy rules with the addresses used by your cluster.
 
-The chart deploys exactly one metrics-agent replica. Values other than
-replicaCount: 1 are rejected until the controller supports leader election.
+## Scrape resources and precedence
+
+| Prometheus Operator | VictoriaMetrics Operator |
+| --- | --- |
+| `ServiceMonitor` | `VMServiceScrape` |
+| `PodMonitor` | `VMPodScrape` |
+| `Probe` | `VMProbe` |
+| `ScrapeConfig` | `VMScrapeConfig` |
+
+Rule and Alertmanager resources are not watched because they do not define
+scrape targets.
+
+VictoriaMetrics objects created by the Prometheus converter carry an owner
+reference to their source object. metrics-agent uses that reference to make the
+choice:
+
+1. Converter-owned VictoriaMetrics objects continue to follow Prometheus.
+2. Native VictoriaMetrics objects receive
+   `operator.victoriametrics.com/ignore-prometheus-updates: enabled`.
+3. A native object wins when both sources use the same name and namespace.
+
+The VictoriaMetrics Operator must create those owner references:
+
+```yaml
+operator:
+  disable_prometheus_converter: false
+  enable_converter_ownership: true
+```
+
+The corresponding Deployment variable is
+`VM_ENABLEDPROMETHEUSCONVERTEROWNERREFERENCES=true`.
+
+During a migration, an annotation can force either source:
+
+```yaml
+metadata:
+  annotations:
+    metrics-agent.rushobservability.com/prefer-source: victoriametrics
+```
+
+The other accepted value is `prometheus`. Choosing `victoriametrics` also
+removes the matching Prometheus owner reference so Kubernetes does not delete
+the object with its former source.
 
 ## Configuration
 
-CLI flags and environment variables use the same names. The most commonly used
-settings are:
+Every setting has a CLI flag and an environment-variable form. Run
+`metrics-agent --help` for the flags.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| METRICS_AGENT_HTTP_ADDRESS | :7070 | Main HTTP listener |
-| METRICS_AGENT_KUBECONFIG | unset | Explicit kubeconfig path |
-| METRICS_AGENT_RESYNC_PERIOD | 5m | Full CRD resync interval |
-| METRICS_AGENT_WORKERS | 2 | Reconciliation workers |
-| METRICS_AGENT_LOG_LEVEL | info | Log level |
-| METRICS_AGENT_UI_ENABLED | false | Opt in to the embedded UI and detailed status/cardinality APIs |
-| METRICS_AGENT_UI_ADDRESS | :7070 | UI listener; same listener by default |
-| METRICS_AGENT_UI_PATH | /ui/ | UI mount path |
-| RUSH_REMOTE_WRITE_URL | unset | Rush remote-write endpoint |
-| RUSH_REMOTE_WRITE_INTERVAL | 15s | Self-metrics heartbeat interval |
-| RUSH_REMOTE_WRITE_TIMEOUT | 30s | Maximum duration of one remote-write request |
-| RUSH_REMOTE_WRITE_CONNECT_TIMEOUT | 5s | Maximum time to connect to Rush |
-| RUSH_REMOTE_WRITE_TOKEN | unset | Ingest-only key scoped to `metrics`; omit only for explicitly open ingestion |
-| RUSH_REMOTE_WRITE_TENANT | unset | Optional routing hint; never grants access without a matching key |
-| METRICS_AGENT_EXTRA_LABELS | `{}` | JSON map added to every remote-write series; configured values win on collision |
-| METRICS_AGENT_SCRAPE_ENABLED | true | Enable discovered-target scraping |
-| METRICS_AGENT_SCRAPE_INTERVAL | 15s | Scrape cycle interval |
-| METRICS_AGENT_SCRAPE_TIMEOUT | 10s | Per-target HTTP timeout |
-| METRICS_AGENT_SCRAPE_DISCOVERY_REFRESH_INTERVAL | 60s | Maximum age of the compiled Kubernetes target cache |
-| METRICS_AGENT_SCRAPE_CONCURRENCY | 8 | Maximum number of targets scraped concurrently |
-| METRICS_AGENT_SCRAPE_ALLOWED_NAMESPACES | empty | Comma-separated namespaces allowed to define scrape objects |
-| METRICS_AGENT_SCRAPE_ALLOWED_DESTINATIONS | empty | Exact hosts/IPs or `*.suffix` patterns allowed to override blocked destinations |
-| METRICS_AGENT_SCRAPE_MAX_RESPONSE_BYTES | 4194304 | Maximum response body per target |
-| METRICS_AGENT_SCRAPE_MAX_SAMPLES_PER_TARGET | 50000 | Maximum parsed samples per target |
-| METRICS_AGENT_SCRAPE_MAX_LABELS_PER_SAMPLE | 64 | Maximum merged target and sample labels |
-| METRICS_AGENT_SCRAPE_MAX_LABEL_NAME_BYTES | 256 | Maximum label-name length |
-| METRICS_AGENT_SCRAPE_MAX_LABEL_VALUE_BYTES | 4096 | Maximum label-value and HELP-text length |
-| METRICS_AGENT_SCRAPE_MAX_METRIC_NAME_BYTES | 1024 | Maximum metric-name length |
-| METRICS_AGENT_SCRAPE_MAX_LINE_BYTES | 65536 | Maximum exposition line length |
-| METRICS_AGENT_VERSION | dev | Version shown in status and UI |
+| `METRICS_AGENT_HTTP_ADDRESS` | `:7070` | Liveness, readiness, and metrics listener |
+| `METRICS_AGENT_KUBECONFIG` | unset | Explicit kubeconfig path |
+| `METRICS_AGENT_RESYNC_PERIOD` | `5m` | Full CRD resync interval |
+| `METRICS_AGENT_WORKERS` | `2` | Reconciliation workers |
+| `METRICS_AGENT_LOG_LEVEL` | `info` | Agent log level |
+| `METRICS_AGENT_UI_ENABLED` | `false` | Enable the UI and detailed status APIs |
+| `METRICS_AGENT_UI_ADDRESS` | `:7070` | UI listener |
+| `METRICS_AGENT_UI_PATH` | `/ui/` | UI mount path |
+| `RUSH_REMOTE_WRITE_URL` | unset | query-api remote-write endpoint |
+| `RUSH_REMOTE_WRITE_INTERVAL` | `15s` | Self-metrics heartbeat interval |
+| `RUSH_REMOTE_WRITE_TIMEOUT` | `30s` | Remote-write request timeout |
+| `RUSH_REMOTE_WRITE_CONNECT_TIMEOUT` | `5s` | Rush connection timeout |
+| `RUSH_REMOTE_WRITE_TOKEN` | unset | Ingest-only API key scoped to `metrics` |
+| `RUSH_REMOTE_WRITE_TENANT` | unset | Tenant routing hint; it does not grant access |
+| `METRICS_AGENT_EXTRA_LABELS` | `{}` | JSON object merged into every outgoing series |
+| `METRICS_AGENT_SCRAPE_ENABLED` | `true` | Enable workload scraping |
+| `METRICS_AGENT_SCRAPE_INTERVAL` | `15s` | Scrape cycle interval |
+| `METRICS_AGENT_SCRAPE_TIMEOUT` | `10s` | Per-target HTTP timeout |
+| `METRICS_AGENT_SCRAPE_DISCOVERY_REFRESH_INTERVAL` | `60s` | Maximum age of the target cache |
+| `METRICS_AGENT_SCRAPE_CONCURRENCY` | `8` | Concurrent target limit |
+| `METRICS_AGENT_SCRAPE_ALLOWED_NAMESPACES` | empty | Comma-separated namespaces allowed to define targets |
+| `METRICS_AGENT_SCRAPE_ALLOWED_DESTINATIONS` | empty | Exact hosts, IPs, or `*.suffix` exceptions to destination blocking |
+| `METRICS_AGENT_SCRAPE_MAX_RESPONSE_BYTES` | `4194304` | Response-body limit per target |
+| `METRICS_AGENT_SCRAPE_MAX_SAMPLES_PER_TARGET` | `50000` | Parsed sample limit per target |
+| `METRICS_AGENT_SCRAPE_MAX_LABELS_PER_SAMPLE` | `64` | Merged label limit per sample |
+| `METRICS_AGENT_SCRAPE_MAX_LABEL_NAME_BYTES` | `256` | Label-name byte limit |
+| `METRICS_AGENT_SCRAPE_MAX_LABEL_VALUE_BYTES` | `4096` | Label-value and HELP-text byte limit |
+| `METRICS_AGENT_SCRAPE_MAX_METRIC_NAME_BYTES` | `1024` | Metric-name byte limit |
+| `METRICS_AGENT_SCRAPE_MAX_LINE_BYTES` | `65536` | Exposition-line byte limit |
+| `METRICS_AGENT_VERSION` | `dev` | Version reported by the status API and UI |
 
-The Helm chart exposes these through helm-chart/values.yaml, including UI, security
-context, resources, ServiceMonitor, NetworkPolicy, and direct Rush remote-write
-settings.
-
-## Embedded control surface
-
-| Endpoint | Purpose |
-| --- | --- |
-| GET /livez | Process liveness |
-| GET /readyz | Informer/cache readiness |
-| GET /metrics | Agent Prometheus metrics |
-| GET /api/v1/status | Collection, process, CRD, cardinality, and remote-write status |
-| GET /api/v1/metrics-summary | Status plus metric examples |
-| GET /ui/ | Embedded control-room UI |
-
-The last three endpoints return 404 unless `METRICS_AGENT_UI_ENABLED=true`.
-Enable them only for local inspection or behind restricted ingress, then
-port-forward the deployed agent:
-
-    kubectl -n monitoring port-forward svc/metrics-agent 7070:7070
-    open http://localhost:7070/ui/
-    curl http://localhost:7070/api/v1/status | jq
-
-The UI shows process CPU and resident memory, watched CRD objects, target
-health, collected series, per-CRD memory estimates, and the top metric names by
-cardinality. Per-object memory is an attribution estimate of serialized
-watch-cache data, not an independent operating-system allocation.
+The Helm equivalents live in [`helm-chart/values.yaml`](helm-chart/values.yaml).
 
 ## Remote write to Rush
 
-The agent sends Snappy-compressed Prometheus remote-write requests to:
+The agent writes to query-api's Prometheus endpoint:
 
-    POST <rush-query-api>/prom/api/v1/write
+```text
+POST <query-api>/prom/api/v1/write
+```
 
-For an open tenant, set the tenant in Helm values or use the URL form:
+An API key is authoritative for its tenant. `RUSH_REMOTE_WRITE_TENANT` and the
+tenant path are routing hints; neither can move a key into another tenant. For
+an open tenant, either of these forms works:
 
-    rushRemoteWrite:
-      enabled: true
-      url: http://rush-query-api.monitoring.svc.cluster.local:8080/prom/api/v1/write
-      tenant: my-team
+```text
+http://rush-query-api.monitoring.svc.cluster.local:8080/prom/api/v1/write
+http://rush-query-api.monitoring.svc.cluster.local:8080/t/my-team/prom/api/v1/write
+```
 
-The equivalent URL is:
+When the detailed status endpoints are enabled, check the latest delivery:
 
-    http://rush-query-api.monitoring.svc.cluster.local:8080/t/my-team/prom/api/v1/write
+```bash
+curl http://localhost:7070/api/v1/status | jq .remote_write
+```
 
-For a locked tenant, use a tenant-scoped API key as a bearer token. The token's
-tenant is authoritative when both a token and tenant header are present.
+Set `RUSH_API_KEY` to a query-capable key when checking the stored metrics:
 
-Verify publishing from the agent status endpoint:
+```bash
+curl -G http://localhost:8080/prom/api/v1/query \
+  -H "Authorization: Bearer ${RUSH_API_KEY}" \
+  --data-urlencode 'query=up'
+```
 
-    curl http://localhost:7070/api/v1/status | jq .remote_write
+## Status and local UI
 
-Set `RUSH_API_KEY` to a tenant-scoped API key, then query Rush through
-query-api:
+| Endpoint | Available by default | Returns |
+| --- | --- | --- |
+| `GET /livez` | yes | Process liveness |
+| `GET /readyz` | yes | Kubernetes watcher readiness |
+| `GET /metrics` | yes | Agent Prometheus metrics |
+| `GET /api/v1/status` | no | Scrape, CRD, process, cardinality, and delivery state |
+| `GET /api/v1/metrics-summary` | no | Status plus metric examples |
+| `GET /ui/` | no | Embedded operator UI |
 
-    curl -G http://localhost:8080/prom/api/v1/query \
-      -H "Authorization: Bearer ${RUSH_API_KEY}" \
-      --data-urlencode 'query=up'
+The last three endpoints return `404` unless
+`METRICS_AGENT_UI_ENABLED=true`. Keep them behind a port-forward or restricted
+ingress because they include cluster inventory and metric names.
 
-## Operations and security
+```bash
+kubectl -n monitoring port-forward svc/metrics-agent 7070:7070
+open http://localhost:7070/ui/
+curl http://localhost:7070/api/v1/status | jq
+```
 
-- The controller reads supported scrape CRDs and patches only the managed
-  VictoriaMetrics precedence annotation and, when explicitly requested, the
-  matching owner reference.
-- The default ServiceAccount uses only the cluster-scoped read/watch permissions
-  required for scrape discovery plus patch access to the supported VictoriaMetrics
-  scrape resources; it has no Events write permission.
-- Scrape responses are streamed into a fixed per-target byte budget. Response,
-  sample, line, metric-name, and label limits reject the target before any
-  partial payload is published.
-- Scrape redirects are disabled. The agent rejects loopback, link-local, cloud
-  metadata, and Kubernetes API destinations before sending a request, including
-  DNS names that resolve to a blocked address. Destination exceptions must be
-  explicit. A namespace allowlist can restrict which teams define targets.
-- The container runs non-root with a read-only filesystem and all Linux
-  capabilities dropped, privilege escalation disabled, RuntimeDefault seccomp,
-  and host namespaces disabled.
-- Store remote-write tokens in Kubernetes Secrets or another secret manager.
-- NetworkPolicy is configurable and empty ingress/egress lists are deny-all;
-  enable it with cluster-specific rules for production deployments.
-- Inspect /readyz, /metrics, and .remote_write in /api/v1/status when collection
-  or delivery is degraded.
+![metrics-agent status UI](docs/metrics-agent-ui.jpg)
 
-## Development
+Per-object memory in the UI estimates serialized watch-cache data. It is not an
+operating-system allocation for that object.
 
-Useful local gates:
+## Security and failure limits
 
-    make test
-    make fmt
-    make clippy
-    make verify
-    node --check ui/app.js
+- The default ServiceAccount can read the resources used for discovery and
+  patch supported VictoriaMetrics scrape resources. It cannot write Events.
+- Redirects are disabled. The resolver blocks loopback, link-local, cloud
+  metadata, and Kubernetes API destinations, including DNS names that resolve
+  to a blocked address. `METRICS_AGENT_SCRAPE_ALLOWED_DESTINATIONS` is the
+  explicit escape hatch.
+- A target that exceeds a response, line, label, metric-name, or sample limit
+  fails before the agent publishes a partial payload.
+- The published container runs as UID `65532` with a read-only filesystem,
+  dropped capabilities, disabled privilege escalation, and RuntimeDefault
+  seccomp.
+- The optional NetworkPolicy is deny-all when enabled with empty rule lists.
+  Supply the Kubernetes API, DNS, scrape target, and query-api egress rules for
+  your cluster.
 
-Build a local image:
+If collection stalls, check `/readyz`, then inspect `.scrape` and
+`.remote_write` in `/api/v1/status`. A `401` or `403` from query-api usually
+means the key is not an ingest key for the tenant and `metrics` signal. Zero
+targets usually points to missing CRDs, selectors that match no Services or
+Pods, or a namespace restriction.
 
-    make image VERSION=0.1.0
+## Development and releases
 
-The pull-request CI workflow runs formatting, all-feature Rust tests, Clippy,
-UI syntax checks, Helm lint/render checks, and workflow YAML validation.
+Build and run the local checks:
 
-## Releases
+```bash
+make build
+make test
+make clippy
+make helm-lint
+make helm-template
+node --check ui/app.js
+```
 
-Pushing a semantic-version tag creates a GitHub Release with Linux amd64 and
-arm64 archives plus SHA-256 checksums. The same workflow publishes a
-multi-architecture image to GHCR. helm- tags are ignored.
+Build a local image with `make image VERSION=0.1.0`.
 
-    git tag -a v0.1.0 -m metrics-agent-v0.1.0
-    git push origin v0.1.0
+A semantic-version tag publishes Linux amd64 and arm64 archives, SHA-256
+checksums, and a multi-architecture image in GHCR:
 
-Release assets are named like:
+```bash
+git tag -a v0.1.0 -m metrics-agent-v0.1.0
+git push origin v0.1.0
+```
 
-    metrics-agent-0.1.0-amd64.tar.gz
-    metrics-agent-0.1.0-arm64.tar.gz
-
-Images are published as:
-
-    ghcr.io/rushobservability/metrics-agent:0.1.0
-    ghcr.io/rushobservability/metrics-agent:v0.1.0
+Release images use both `0.1.0` and `v0.1.0` tags under
+`ghcr.io/rushobservability/metrics-agent`.
 
 ## Part of Rush
 
-metrics-agent is normally deployed alongside:
+metrics-agent can discover and scrape targets on its own, but Rush is the
+destination it is built for. It normally runs alongside:
 
-- [query-api](https://github.com/RushObservability/query-api) — ingest, query, and tenant routing
-- [sre-agent](https://github.com/RushObservability/sre-agent) — AI-assisted investigations
-- [helm-charts](https://github.com/RushObservability/helm-charts) — shared deployment charts
+- [query-api](https://github.com/RushObservability/query-api), which accepts
+  remote write and stores the samples
+- [frontend](https://github.com/RushObservability/frontend), which queries and
+  graphs the metrics
+- [sre-agent](https://github.com/RushObservability/sre-agent), which uses them
+  during investigations
+- [helm-charts](https://github.com/RushObservability/helm-charts), which deploys
+  the complete stack
 
 ## License
 
-The project is licensed under Apache License 2.0. See [LICENSE](LICENSE) for
-the complete terms; the Rust package and Helm chart metadata use Apache-2.0.
+[Apache License 2.0](LICENSE).
