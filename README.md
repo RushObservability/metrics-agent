@@ -77,16 +77,25 @@ The process needs permission to list and watch the supported scrape resources,
 Services, Endpoints, and Pods. It also needs patch access to the supported
 VictoriaMetrics scrape resources when precedence reconciliation is enabled.
 
+The current controller requires all four VictoriaMetrics scrape CRDs at
+startup: `VMServiceScrape`, `VMPodScrape`, `VMProbe`, and `VMScrapeConfig`.
+The corresponding Prometheus CRD is optional for each resource pair. You do
+not need to run VictoriaMetrics or create VM scrape objects.
+
 ## Install with Helm
 
-Install the chart from this repository with a published image:
+Set `METRICS_AGENT_IMAGE_TAG` to the image version supplied with your Rush
+release, then install the chart from this repository. Do not use a mutable
+`latest` tag.
 
 ```bash
+export METRICS_AGENT_IMAGE_TAG='<release-tag>'
+
 helm upgrade --install metrics-agent ./helm-chart \
   --namespace monitoring \
   --create-namespace \
   --set image.repository=ghcr.io/rushobservability/metrics-agent \
-  --set image.tag=0.1.0 \
+  --set-string image.tag="${METRICS_AGENT_IMAGE_TAG}" \
   --set rushRemoteWrite.enabled=true \
   --set rushRemoteWrite.url=http://rush-query-api.monitoring.svc.cluster.local:8080/prom/api/v1/write
 ```
