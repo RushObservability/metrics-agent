@@ -36,10 +36,10 @@ async fn main() -> Result<()> {
         let tenant = config.rush_remote_write_tenant.clone();
         let extra_labels = config.extra_labels.clone();
         let interval = config.rush_remote_write_interval;
-        let client = reqwest::Client::builder()
-            .connect_timeout(config.rush_remote_write_connect_timeout)
-            .timeout(config.rush_remote_write_timeout)
-            .build()?;
+        let client = remote_write::http_client(
+            config.rush_remote_write_connect_timeout,
+            config.rush_remote_write_timeout,
+        )?;
         let shutdown = shutdown.clone();
         tokio::spawn(remote_write::run(
             client,
@@ -75,7 +75,8 @@ async fn main() -> Result<()> {
         }
     }
     let server_shutdown = shutdown.clone();
-    let server = axum::serve(listener, http::router(Arc::clone(&controller)))
+    let primary_router = http::primary_router(Arc::clone(&controller))?;
+    let server = axum::serve(listener, primary_router)
         .with_graceful_shutdown(async move { server_shutdown.cancelled().await })
         .into_future();
     tokio::pin!(server);

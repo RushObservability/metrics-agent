@@ -27,6 +27,8 @@ scrape:
   # Per-target resource bounds. A target that exceeds any limit fails its
   # scrape without publishing a partial payload.
   maxResponseBytes: 4194304
+  # Decoded sample/metadata budget per target. Concurrency multiplies this budget.
+  maxRetainedBytes: 8388608
   maxSamplesPerTarget: 50000
   maxLabelsPerSample: 64
   maxLabelNameBytes: 256

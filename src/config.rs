@@ -38,7 +38,7 @@ fn parse_extra_labels(value: &str) -> Result<BTreeMap<String, String>, String> {
     Ok(labels)
 }
 
-#[derive(Clone, Debug, Parser)]
+#[derive(Clone, Parser)]
 #[command(
     name = "metrics-agent",
     version,
@@ -74,7 +74,7 @@ pub struct Config {
     #[arg(long, env = "METRICS_AGENT_UI_PATH", default_value = "/ui/")]
     pub ui_path: String,
 
-    #[arg(long, env = "RUSH_REMOTE_WRITE_URL")]
+    #[arg(long, env = "RUSH_REMOTE_WRITE_URL", hide_env_values = true)]
     pub rush_remote_write_url: Option<String>,
 
     #[arg(
@@ -101,7 +101,7 @@ pub struct Config {
     )]
     pub rush_remote_write_connect_timeout: Duration,
 
-    #[arg(long, env = "RUSH_REMOTE_WRITE_TOKEN")]
+    #[arg(long, env = "RUSH_REMOTE_WRITE_TOKEN", hide_env_values = true)]
     pub rush_remote_write_token: Option<String>,
 
     #[arg(long, env = "RUSH_REMOTE_WRITE_TENANT")]
@@ -175,6 +175,10 @@ pub struct Config {
         default_value_t = 4_194_304
     )]
     pub scrape_max_response_bytes: usize,
+
+    /// Per-target decoded sample/metadata budget, including copied labels and HELP text.
+    #[arg(long, env = "METRICS_AGENT_SCRAPE_MAX_RETAINED_BYTES", value_parser = parse_positive_usize, default_value_t = 8_388_608)]
+    pub scrape_max_retained_bytes: usize,
 
     #[arg(
         long,
@@ -256,6 +260,24 @@ impl Config {
         kube::Config::infer()
             .await
             .context("infer in-cluster or local Kubernetes configuration")
+    }
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("http_address", &self.http_address)
+            .field("ui_enabled", &self.ui_enabled)
+            .field("scrape_enabled", &self.scrape_enabled)
+            .field(
+                "remote_write_configured",
+                &self.rush_remote_write_url.is_some(),
+            )
+            .field(
+                "remote_write_token_configured",
+                &self.rush_remote_write_token.is_some(),
+            )
+            .finish_non_exhaustive()
     }
 }
 

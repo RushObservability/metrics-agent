@@ -73,6 +73,7 @@ pub struct CollectedMetric {
 #[derive(Clone, Copy, Debug)]
 pub struct ScrapeLimits {
     pub max_response_bytes: usize,
+    pub max_retained_bytes: usize,
     pub max_samples_per_target: usize,
     pub max_labels_per_sample: usize,
     pub max_label_name_bytes: usize,
@@ -85,6 +86,7 @@ impl Default for ScrapeLimits {
     fn default() -> Self {
         Self {
             max_response_bytes: 4_194_304,
+            max_retained_bytes: 8_388_608,
             max_samples_per_target: 50_000,
             max_labels_per_sample: 64,
             max_label_name_bytes: 256,
@@ -115,6 +117,17 @@ pub enum ScrapeMessage {
 pub struct PublishResult {
     pub series: u64,
     pub samples: u64,
+}
+
+pub fn http_client(
+    connect_timeout: std::time::Duration,
+    timeout: std::time::Duration,
+) -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .connect_timeout(connect_timeout)
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?)
 }
 
 /// Converts the agent's own Prometheus exposition into Rush's remote-write
@@ -369,11 +382,14 @@ pub fn parse_prometheus_text(
     default_timestamp: i64,
     limits: ScrapeLimits,
 ) -> Result<Vec<CollectedMetric>> {
+    if body.len() > limits.max_response_bytes {
+        bail!("scrape response exceeds the configured byte limit");
+    }
     let mut parser = PrometheusTextParser::new(target_labels, default_timestamp, limits)?;
     for line in body.lines() {
         parser.push_line(line)?;
     }
-    Ok(parser.finish())
+    parser.finish()
 }
 
 /// Incremental Prometheus text parser used by the HTTP scraper. It retains
@@ -385,6 +401,7 @@ pub struct PrometheusTextParser {
     helps: HashMap<String, String>,
     types: HashMap<String, i32>,
     samples: Vec<CollectedMetric>,
+    retained_bytes: usize,
 }
 
 impl PrometheusTextParser {
@@ -394,6 +411,13 @@ impl PrometheusTextParser {
         limits: ScrapeLimits,
     ) -> Result<Self> {
         validate_target_labels(target_labels, limits)?;
+        let retained_bytes = target_labels
+            .iter()
+            .map(|(name, value)| name.len() + value.len() + std::mem::size_of::<(String, String)>())
+            .sum::<usize>();
+        if retained_bytes > limits.max_retained_bytes {
+            bail!("decoded scrape exceeds the configured retained-byte limit");
+        }
         Ok(Self {
             target_labels: target_labels.to_vec(),
             default_timestamp,
@@ -401,6 +425,7 @@ impl PrometheusTextParser {
             helps: HashMap::new(),
             types: HashMap::new(),
             samples: Vec::new(),
+            retained_bytes,
         })
     }
 
@@ -415,6 +440,11 @@ impl PrometheusTextParser {
                 if description.len() > self.limits.max_label_value_bytes {
                     bail!("Prometheus HELP text exceeds the configured byte limit");
                 }
+                let old = self
+                    .helps
+                    .get(name)
+                    .map_or(0, |value| name.len() + value.len() + 128);
+                self.charge_retained((name.len() + description.len() + 128).saturating_sub(old))?;
                 self.helps.insert(name.to_string(), description.to_string());
             }
             return Ok(());
@@ -423,6 +453,9 @@ impl PrometheusTextParser {
             let mut fields = kind.split_whitespace();
             if let (Some(name), Some(kind)) = (fields.next(), fields.next()) {
                 validate_metric_name(name, self.limits)?;
+                if !self.types.contains_key(name) {
+                    self.charge_retained(name.len() + 128)?;
+                }
                 self.types.insert(name.to_string(), metric_type(kind));
             }
             return Ok(());
@@ -459,6 +492,15 @@ impl PrometheusTextParser {
                 merged.push((label.name, label.value));
             }
         }
+        let sample_bytes = std::mem::size_of::<CollectedMetric>()
+            + name.len()
+            + merged
+                .iter()
+                .map(|(name, value)| {
+                    name.len() + value.len() + std::mem::size_of::<(String, String)>()
+                })
+                .sum::<usize>();
+        self.charge_retained(sample_bytes)?;
         self.samples.push(CollectedMetric {
             name: name.to_string(),
             labels: merged,
@@ -470,7 +512,24 @@ impl PrometheusTextParser {
         Ok(())
     }
 
-    pub fn finish(mut self) -> Vec<CollectedMetric> {
+    fn charge_retained(&mut self, bytes: usize) -> Result<()> {
+        let total = self
+            .retained_bytes
+            .checked_add(bytes)
+            .context("decoded scrape size overflow")?;
+        if total > self.limits.max_retained_bytes {
+            bail!("decoded scrape exceeds the configured retained-byte limit");
+        }
+        self.retained_bytes = total;
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<Vec<CollectedMetric>> {
+        // HELP may arrive after samples. Account for every copy before cloning.
+        let help_bytes = self.samples.iter().fold(0usize, |total, sample| {
+            total.saturating_add(self.helps.get(&sample.name).map_or(0, String::len))
+        });
+        self.charge_retained(help_bytes)?;
         for sample in &mut self.samples {
             sample.help = self.helps.get(&sample.name).cloned().unwrap_or_default();
             sample.metric_type = self
@@ -480,7 +539,7 @@ impl PrometheusTextParser {
                 .and_then(|value| MetricType::try_from(value).ok())
                 .unwrap_or(MetricType::Gauge);
         }
-        self.samples
+        Ok(self.samples)
     }
 }
 
@@ -785,6 +844,130 @@ mod tests {
         UiStatus,
     };
 
+    #[test]
+    fn decoded_budget_rejects_repeated_label_and_help_expansion() {
+        let limits = ScrapeLimits {
+            max_retained_bytes: 2048,
+            ..ScrapeLimits::default()
+        };
+        let labels = [("shared".into(), "x".repeat(1024))];
+        assert!(
+            parse_prometheus_text("a 1\na 2\n", &labels, 0, limits)
+                .unwrap_err()
+                .to_string()
+                .contains("retained-byte")
+        );
+        let body = format!("a 1\na 2\n# HELP a {}\n", "x".repeat(1024));
+        assert!(body.len() < limits.max_response_bytes);
+        assert!(
+            parse_prometheus_text(&body, &[], 0, limits)
+                .unwrap_err()
+                .to_string()
+                .contains("retained-byte")
+        );
+    }
+
+    #[test]
+    fn decoded_budget_handles_metadata_without_samples_and_normal_scrapes() {
+        let limits = ScrapeLimits {
+            max_retained_bytes: 2048,
+            ..ScrapeLimits::default()
+        };
+        let metadata = (0..40)
+            .map(|i| format!("# TYPE m{i} gauge\n"))
+            .collect::<String>();
+        assert!(parse_prometheus_text(&metadata, &[], 0, limits).is_err());
+        let normal = parse_prometheus_text(
+            "# HELP a Request count.\na{code=\"200\"} 1\n",
+            &[("job".into(), "api".into())],
+            0,
+            limits,
+        )
+        .unwrap();
+        assert_eq!(normal.len(), 1);
+        assert_eq!(normal[0].help, "Request count.");
+    }
+
+    #[tokio::test]
+    async fn remote_write_redirects_never_forward_payload_or_tenant() {
+        use axum::{
+            Router,
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+        };
+        use std::{
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            time::Duration,
+        };
+        let sink_hits = Arc::new(AtomicUsize::new(0));
+        let received = sink_hits.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination = format!("http://{}", listener.local_addr().unwrap());
+        let sink = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(move || {
+                    let received = received.clone();
+                    async move {
+                        received.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::OK
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        });
+        let client = super::http_client(Duration::from_secs(2), Duration::from_secs(2)).unwrap();
+        for code in [301, 302, 303, 307, 308] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let location = destination.clone();
+            let source_hits = Arc::new(AtomicUsize::new(0));
+            let received = source_hits.clone();
+            let source = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    Router::new().fallback(move |headers: HeaderMap, body: axum::body::Bytes| {
+                        let received = received.clone();
+                        let location = location.clone();
+                        async move {
+                            assert_eq!(headers["authorization"], "Bearer test-token");
+                            assert_eq!(headers["x-rush-tenant"], "tenant-a");
+                            assert!(!body.is_empty());
+                            received.fetch_add(1, Ordering::SeqCst);
+                            (
+                                StatusCode::from_u16(code).unwrap(),
+                                [("location", location)],
+                            )
+                                .into_response()
+                        }
+                    }),
+                )
+                .await
+                .unwrap();
+            });
+            let error = super::publish(
+                &client,
+                &url,
+                Some("test-token"),
+                Some("tenant-a"),
+                &snapshot(),
+                &[],
+                &BTreeMap::new(),
+            )
+            .await
+            .unwrap_err();
+            assert!(error.to_string().contains(&code.to_string()));
+            assert_eq!(source_hits.load(Ordering::SeqCst), 1);
+            assert_eq!(sink_hits.load(Ordering::SeqCst), 0);
+            source.abort();
+        }
+        sink.abort();
+    }
+
     fn snapshot() -> StatusSnapshot {
         StatusSnapshot {
             version: "test".into(),
@@ -1002,7 +1185,7 @@ request_total{job="scrape",path="a\\b\"c\n",code="200"} 3.5 1700000000123
         parser.push_line("requests_total 3").unwrap();
         parser.push_line("# HELP requests_total Requests.").unwrap();
         parser.push_line("# TYPE requests_total counter").unwrap();
-        let samples = parser.finish();
+        let samples = parser.finish().unwrap();
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].help, "Requests.");
         assert_eq!(samples[0].metric_type, MetricType::Counter);

@@ -109,18 +109,10 @@ pub async fn run(
     sender: mpsc::Sender<ScrapeMessage>,
     shutdown: CancellationToken,
 ) {
-    let http = match reqwest::Client::builder()
-        .timeout(controller.config().scrape_timeout)
-        .user_agent("rush-metrics-agent")
-        // A redirect target has not passed the destination checks below.
-        .redirect(reqwest::redirect::Policy::none())
-        // Re-check every connection-time DNS answer so a name cannot pass the
-        // discovery check and then rebind to a protected address.
-        .dns_resolver(Arc::new(SafeResolver {
-            allowed: controller.config().scrape_allowed_destinations.clone(),
-        }))
-        .build()
-    {
+    let http = match scrape_client(
+        controller.config().scrape_timeout,
+        controller.config().scrape_allowed_destinations.clone(),
+    ) {
         Ok(client) => client,
         Err(error) => {
             warn!(error = %error, "unable to build scrape HTTP client");
@@ -177,6 +169,17 @@ pub async fn run(
     }
 }
 
+fn scrape_client(timeout: Duration, allowed: Vec<String>) -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .timeout(timeout)
+        .user_agent("rush-metrics-agent")
+        .redirect(reqwest::redirect::Policy::none())
+        // A proxy can resolve targets itself, bypassing SafeResolver.
+        .no_proxy()
+        .dns_resolver(Arc::new(SafeResolver { allowed }))
+        .build()?)
+}
+
 async fn scrape_once(
     controller: &Controller,
     http: &reqwest::Client,
@@ -192,6 +195,7 @@ async fn scrape_once(
         .await?;
     let limits = ScrapeLimits {
         max_response_bytes: controller.config().scrape_max_response_bytes,
+        max_retained_bytes: controller.config().scrape_max_retained_bytes,
         max_samples_per_target: controller.config().scrape_max_samples_per_target,
         max_labels_per_sample: controller.config().scrape_max_labels_per_sample,
         max_label_name_bytes: controller.config().scrape_max_label_name_bytes,
@@ -313,9 +317,20 @@ fn namespace_allowed(namespace: &str, allowed: &[String]) -> bool {
 }
 
 fn destination_explicitly_allowed(host: &str, allowed: &[String]) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let host = host
+        .trim_matches(['[', ']'])
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
     allowed.iter().any(|candidate| {
-        let candidate = candidate.trim().trim_end_matches('.').to_ascii_lowercase();
+        let candidate = candidate
+            .trim()
+            .trim_matches(['[', ']'])
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if let (Ok(host_ip), Ok(allowed_ip)) = (host.parse::<IpAddr>(), candidate.parse::<IpAddr>())
+        {
+            return host_ip == allowed_ip;
+        }
         if let Some(suffix) = candidate.strip_prefix("*.") {
             host != suffix && host.ends_with(&format!(".{suffix}"))
         } else {
@@ -345,6 +360,11 @@ fn kubernetes_service_ip() -> Option<IpAddr> {
 }
 
 fn unsafe_destination_ip(ip: IpAddr) -> bool {
+    if let IpAddr::V6(v6) = ip {
+        if let Some(v4) = v6.to_ipv4() {
+            return unsafe_destination_ip(IpAddr::V4(v4));
+        }
+    }
     if kubernetes_service_ip() == Some(ip) {
         return true;
     }
@@ -352,15 +372,18 @@ fn unsafe_destination_ip(ip: IpAddr) -> bool {
         IpAddr::V4(ip) => {
             ip.is_loopback()
                 || ip.is_link_local()
-                || ip.is_unspecified()
+                || ip.octets()[0] == 0
+                || ip.is_broadcast()
                 || ip.is_multicast()
                 || ip == Ipv4Addr::new(169, 254, 169, 254)
+                || ip == Ipv4Addr::new(100, 100, 100, 200)
         }
         IpAddr::V6(ip) => {
             ip.is_loopback()
                 || ip.is_unspecified()
                 || ip.is_multicast()
                 || (ip.segments()[0] & 0xffc0) == 0xfe80
+                || ip == std::net::Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)
         }
     }
 }
@@ -414,7 +437,8 @@ fn validate_scrape_url(raw: &str, allowed: &[String]) -> Result<Url> {
     }
     let host = url
         .host_str()
-        .ok_or_else(|| anyhow::anyhow!("scrape target URL has no host"))?;
+        .ok_or_else(|| anyhow::anyhow!("scrape target URL has no host"))?
+        .trim_matches(['[', ']']);
     if destination_explicitly_allowed(host, allowed) {
         return Ok(url);
     }
@@ -516,7 +540,7 @@ impl BoundedTextParser {
                 std::str::from_utf8(&self.pending).context("scrape response is not valid UTF-8")?,
             )?;
         }
-        Ok(self.parser.finish())
+        self.parser.finish()
     }
 }
 
@@ -1119,6 +1143,100 @@ mod tests {
         assert!(validate_scrape_url("http://127.0.0.1:9090/metrics", &[]).is_err());
         assert!(
             validate_scrape_url("http://127.0.0.1:9090/metrics", &["127.0.0.1".into()]).is_ok()
+        );
+    }
+
+    #[test]
+    fn ipv6_literals_cannot_bypass_destination_policy() {
+        for host in [
+            "[::1]",
+            "[::]",
+            "[fe80::1]",
+            "[ff02::1]",
+            "[::ffff:127.0.0.1]",
+            "[::ffff:169.254.169.254]",
+        ] {
+            assert!(
+                validate_scrape_url(&format!("http://{host}:9090/metrics"), &[]).is_err(),
+                "{host}"
+            );
+        }
+    }
+
+    #[test]
+    fn mapped_dns_answers_are_blocked_but_private_cluster_ips_work() {
+        for ip in [
+            "::ffff:127.0.0.1",
+            "::ffff:169.254.169.254",
+            "::ffff:0.0.0.0",
+            "::127.0.0.1",
+        ] {
+            assert!(unsafe_destination_ip(ip.parse().unwrap()), "{ip}");
+        }
+        for host in ["[fd00::20]", "[::ffff:10.0.0.20]"] {
+            assert!(validate_scrape_url(&format!("http://{host}/metrics"), &[]).is_ok());
+        }
+        assert!(validate_scrape_url("http://[::1]/metrics", &["::1".into()]).is_ok());
+        assert!(validate_scrape_url("http://[::1]/metrics", &["[0:0:0:0:0:0:0:1]".into()]).is_ok());
+    }
+
+    #[test]
+    fn cloud_metadata_addresses_are_denied_in_both_ip_families() {
+        for host in [
+            "169.254.169.254",
+            "100.100.100.200",
+            "[fd00:ec2::254]",
+            "[::ffff:100.100.100.200]",
+        ] {
+            assert!(
+                validate_scrape_url(&format!("http://{host}/metrics"), &[]).is_err(),
+                "{host}"
+            );
+            assert!(unsafe_destination_ip(
+                host.trim_matches(['[', ']']).parse().unwrap()
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn scrape_proxy_child() {
+        if std::env::var_os("METRICS_AGENT_PROXY_TEST_CHILD").is_none() {
+            return;
+        }
+        let client = super::scrape_client(std::time::Duration::from_secs(1), vec![]).unwrap();
+        // This literal has no DNS lookup. A proxy would otherwise receive the request.
+        let _ = client.get("http://127.0.0.1:1/metrics").send().await;
+    }
+
+    #[tokio::test]
+    async fn scraper_ignores_environment_proxies() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = format!("http://{}", listener.local_addr().unwrap());
+        let exe = std::env::current_exe().unwrap();
+        let child = tokio::task::spawn_blocking(move || {
+            std::process::Command::new(exe)
+                .args(["--exact", "scraper::tests::scrape_proxy_child"])
+                .env("METRICS_AGENT_PROXY_TEST_CHILD", "1")
+                .env("HTTP_PROXY", &proxy)
+                .env("http_proxy", &proxy)
+                .env("ALL_PROXY", &proxy)
+                .env("all_proxy", &proxy)
+                .env("NO_PROXY", "")
+                .env("no_proxy", "")
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(
+            child.status.success(),
+            "{}",
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
         );
     }
 
