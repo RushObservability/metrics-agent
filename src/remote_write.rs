@@ -869,13 +869,16 @@ mod tests {
 
     #[test]
     fn decoded_budget_handles_metadata_without_samples_and_normal_scrapes() {
+        use std::fmt::Write;
+
         let limits = ScrapeLimits {
             max_retained_bytes: 2048,
             ..ScrapeLimits::default()
         };
-        let metadata = (0..40)
-            .map(|i| format!("# TYPE m{i} gauge\n"))
-            .collect::<String>();
+        let mut metadata = String::new();
+        for i in 0..40 {
+            writeln!(metadata, "# TYPE m{i} gauge").unwrap();
+        }
         assert!(parse_prometheus_text(&metadata, &[], 0, limits).is_err());
         let normal = parse_prometheus_text(
             "# HELP a Request count.\na{code=\"200\"} 1\n",
