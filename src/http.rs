@@ -13,17 +13,33 @@ use crate::{controller::Controller, metrics};
 pub fn router(controller: Arc<Controller>) -> Router {
     let [ui_path, ui_index_path, ui_styles_path, ui_app_path] =
         ui_route_paths(&controller.config().ui_path);
+    health_router(controller.clone()).merge(
+        Router::new()
+            .route("/api/v1/status", get(status))
+            .route("/api/v1/metrics-summary", get(metrics_summary))
+            .route(&ui_path, get(ui_redirect))
+            .route(&ui_index_path, get(ui_index))
+            .route(&ui_styles_path, get(ui_styles))
+            .route(&ui_app_path, get(ui_app))
+            .with_state(controller),
+    )
+}
+
+pub fn health_router(controller: Arc<Controller>) -> Router {
     Router::new()
         .route("/livez", get(livez))
         .route("/readyz", get(readyz))
         .route("/metrics", get(prometheus_metrics))
-        .route("/api/v1/status", get(status))
-        .route("/api/v1/metrics-summary", get(metrics_summary))
-        .route(&ui_path, get(ui_redirect))
-        .route(&ui_index_path, get(ui_index))
-        .route(&ui_styles_path, get(ui_styles))
-        .route(&ui_app_path, get(ui_app))
         .with_state(controller)
+}
+
+pub fn primary_router(controller: Arc<Controller>) -> anyhow::Result<Router> {
+    let config = controller.config();
+    if config.ui_enabled && config.ui_socket_addr()? == config.http_socket_addr()? {
+        Ok(router(controller))
+    } else {
+        Ok(health_router(controller))
+    }
 }
 
 const UI_INDEX: &str = include_str!("../ui/index.html");
@@ -180,6 +196,75 @@ mod tests {
         body::to_bytes,
         http::{StatusCode, header},
     };
+
+    #[tokio::test]
+    async fn separate_ui_listener_does_not_expose_diagnostics_on_primary() {
+        use clap::Parser;
+        use tower::ServiceExt;
+        for separate in [true, false] {
+            let ui_address = if separate {
+                "127.0.0.1:7071"
+            } else {
+                "0.0.0.0:7070"
+            };
+            let config = crate::config::Config::try_parse_from([
+                "metrics-agent",
+                "--ui-enabled",
+                "--http-address=0.0.0.0:7070",
+                "--ui-address",
+                ui_address,
+            ])
+            .unwrap();
+            let client =
+                kube::Client::try_from(kube::Config::new("http://127.0.0.1:1".parse().unwrap()))
+                    .unwrap();
+            let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+            let controller = crate::controller::Controller::new(client, config, sender);
+            for path in [
+                "/ui/",
+                "/ui/app.js",
+                "/api/v1/status",
+                "/api/v1/metrics-summary",
+            ] {
+                let request = || {
+                    axum::http::Request::get(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap()
+                };
+                let primary = super::primary_router(controller.clone())
+                    .unwrap()
+                    .oneshot(request())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    primary.status(),
+                    if separate {
+                        StatusCode::NOT_FOUND
+                    } else {
+                        StatusCode::OK
+                    },
+                    "{path}"
+                );
+                let ui = super::router(controller.clone())
+                    .oneshot(request())
+                    .await
+                    .unwrap();
+                assert_eq!(ui.status(), StatusCode::OK);
+            }
+            for path in ["/livez", "/metrics"] {
+                let response = super::primary_router(controller.clone())
+                    .unwrap()
+                    .oneshot(
+                        axum::http::Request::get(path)
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+            }
+        }
+    }
 
     #[test]
     fn normalizes_ui_paths_for_default_custom_and_root_paths() {

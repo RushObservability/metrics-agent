@@ -58,6 +58,7 @@ spec:
             - --scrape-discovery-refresh-interval={{ .Values.scrape.discoveryRefreshInterval }}
             - --scrape-concurrency={{ .Values.scrape.concurrency | int }}
             - --scrape-max-response-bytes={{ .Values.scrape.maxResponseBytes | int }}
+            - --scrape-max-retained-bytes={{ .Values.scrape.maxRetainedBytes | int }}
             - --scrape-max-samples-per-target={{ .Values.scrape.maxSamplesPerTarget | int }}
             - --scrape-max-labels-per-sample={{ .Values.scrape.maxLabelsPerSample | int }}
             - --scrape-max-label-name-bytes={{ .Values.scrape.maxLabelNameBytes | int }}

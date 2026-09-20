@@ -47,6 +47,9 @@ tests:
           content: --scrape-max-response-bytes=4194304
       - contains:
           path: spec.template.spec.containers[0].args
+          content: --scrape-max-retained-bytes=8388608
+      - contains:
+          path: spec.template.spec.containers[0].args
           content: --scrape-max-samples-per-target=50000
       - contains:
           path: spec.template.spec.containers[0].args
