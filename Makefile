@@ -1,4 +1,4 @@
-.PHONY: build run test fmt check clippy helm-lint helm-template image
+.PHONY: build run test fmt check clippy helm-lint helm-template image release
 
 VERSION ?= dev
 IMAGE ?= ghcr.io/rushobservability/metrics-agent:$(VERSION)
@@ -38,3 +38,9 @@ verify: fmt test helm-lint helm-template
 
 image:
 	docker build --build-arg VERSION=$(VERSION) -t $(IMAGE) .
+
+# Open a version-bump PR. VERSION=x.y.z overrides the automatic patch bump and
+# DRY_RUN=1 prints the plan without changing anything. Only a VERSION given on
+# the command line counts, so the image default above is never used here.
+release:
+	@VERSION="$(if $(filter command line,$(origin VERSION)),$(VERSION),)" DRY_RUN="$(DRY_RUN)" ./scripts/release.sh

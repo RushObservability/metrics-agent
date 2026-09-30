@@ -314,16 +314,30 @@ node --check ui/app.js
 
 Build a local image with `make image VERSION=0.1.0`.
 
-A semantic-version tag publishes Linux amd64 and arm64 archives, SHA-256
-checksums, and a multi-architecture image in GHCR:
+Releases follow the Cargo package version. From an up-to-date `main`, open a
+version-bump PR:
 
 ```bash
-git tag -a v0.1.0 -m metrics-agent-v0.1.0
-git push origin v0.1.0
+make release
 ```
 
-Release images use both `0.1.0` and `v0.1.0` tags under
+That bumps the patch version in `Cargo.toml` and `Cargo.lock` on a
+`release/vX.Y.Z` branch, runs the format, Clippy, and test checks, and opens
+the PR. Pass `VERSION=0.2.0` to choose the version, or `DRY_RUN=1` to print the
+plan without changing anything.
+
+Merging the PR starts the Release workflow. It runs the security gate, then
+publishes Linux amd64 and arm64 archives, SHA-256 checksums, and a
+multi-architecture image in GHCR, and creates the `vX.Y.Z` tag and GitHub
+release. Release images use both `0.1.0` and `v0.1.0` tags under
 `ghcr.io/rushobservability/metrics-agent`.
+
+The first release has no earlier tag to bump from. Run the Release workflow
+manually to publish the version already in `Cargo.toml`:
+
+```bash
+gh workflow run release.yml --repo RushObservability/metrics-agent --ref main
+```
 
 ## Part of Rush
 

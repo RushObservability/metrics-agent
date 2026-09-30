@@ -2,8 +2,11 @@ name: Release metrics-agent
 
 on:
   push:
-    tags:
-      - '**'
+    branches:
+      - main
+    paths:
+      - Cargo.toml
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -13,44 +16,93 @@ permissions:
   artifact-metadata: write
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: metrics-agent-release
   cancel-in-progress: false
 
 jobs:
-  validate-tag:
-    name: Validate release tag
+  # `make release` opens a PR that bumps Cargo.toml. Merging it starts this
+  # workflow, which tags the merge commit. A manual run releases the current
+  # Cargo.toml version, which is how the first release is published.
+  release-plan:
+    name: Plan release
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     outputs:
-      release: ${{ steps.tag.outputs.release }}
-      version: ${{ steps.tag.outputs.version }}
+      release: ${{ steps.plan.outputs.release }}
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
     steps:
-      - name: Check tag
-        id: tag
+      - name: Check out full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Read and validate package version
+        id: plan
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
         run: |
-          tag="${GITHUB_REF_NAME}"
+          set -euo pipefail
+          read_version() {
+            awk -v package="$1" '
+              $0 == package { in_package = 1; next }
+              in_package && /^\[/ { exit }
+              in_package && /^version = "/ {
+                value = $0
+                sub(/^version = "/, "", value)
+                sub(/".*$/, "", value)
+                print value
+                exit
+              }
+            '
+          }
 
-          if [[ "${tag}" == helm-* ]]; then
-            echo "Ignoring Helm tag ${tag}"
-            echo "release=false" >> "${GITHUB_OUTPUT}"
-            exit 0
+          version="$(read_version '[package]' < Cargo.toml)"
+          lock_version="$(read_version 'name = "metrics-agent"' < Cargo.lock)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Cargo.toml has an invalid release version: $version" >&2
+            exit 1
+          fi
+          if [[ "$lock_version" != "$version" ]]; then
+            echo "Cargo.lock version $lock_version does not match Cargo.toml version $version" >&2
+            echo "Run: cargo update -p metrics-agent --precise $version" >&2
+            exit 1
           fi
 
-          if [[ "${tag}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
-            echo "release=true" >> "${GITHUB_OUTPUT}"
-            echo "version=${tag#v}" >> "${GITHUB_OUTPUT}"
-            exit 0
+          release=true
+          if [[ "$EVENT_NAME" == push && "$BEFORE_SHA" =~ ^[0-9a-f]{40}$ && "$BEFORE_SHA" != 0000000000000000000000000000000000000000 ]]; then
+            previous="$(git show "${BEFORE_SHA}:Cargo.toml" | read_version '[package]')"
+            if [[ "$previous" == "$version" ]]; then
+              release=false
+              echo "Cargo.toml changed without a version bump; no release requested." >> "$GITHUB_STEP_SUMMARY"
+            fi
           fi
 
-          echo "Ignoring non-semver tag ${tag}"
-          echo "release=false" >> "${GITHUB_OUTPUT}"
+          tag="v${version}"
+          if [[ "$release" == true ]] && git rev-parse --verify --quiet "refs/tags/${tag}" >/dev/null; then
+            echo "Tag ${tag} already exists. Bump the Cargo package version before releasing." >&2
+            exit 1
+          fi
+          if [[ "$release" == true ]]; then
+            echo "Releasing ${tag}" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          {
+            echo "release=${release}"
+            echo "version=${version}"
+            echo "tag=${tag}"
+          } >> "$GITHUB_OUTPUT"
 
   security-gate:
     name: Security release gate
-    needs: validate-tag
-    if: needs.validate-tag.outputs.release == 'true'
+    needs: release-plan
+    if: needs.release-plan.outputs.release == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    permissions:
+      contents: read
     steps:
       - name: Check out full history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -79,9 +131,11 @@ jobs:
 
   build:
     name: Build ${{ matrix.arch }}
-    needs: [validate-tag, security-gate]
-    if: needs.validate-tag.outputs.release == 'true' && needs.security-gate.result == 'success'
+    needs: [release-plan, security-gate]
+    if: needs.release-plan.outputs.release == 'true' && needs.security-gate.result == 'success'
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -110,7 +164,7 @@ jobs:
       - name: Package release binary
         shell: bash
         env:
-          VERSION: ${{ needs.validate-tag.outputs.version }}
+          VERSION: ${{ needs.release-plan.outputs.version }}
         run: |
           package="metrics-agent-${VERSION}-${{ matrix.arch }}"
           mkdir -p dist
@@ -128,9 +182,9 @@ jobs:
   release:
     name: Publish GitHub release
     needs:
-      - validate-tag
+      - release-plan
       - build
-    if: needs.validate-tag.outputs.release == 'true' && needs.build.result == 'success'
+    if: needs.release-plan.outputs.release == 'true' && needs.build.result == 'success'
     runs-on: ubuntu-24.04
     steps:
       - name: Check out source
@@ -163,10 +217,10 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
-            VERSION=${{ needs.validate-tag.outputs.version }}
+            VERSION=${{ needs.release-plan.outputs.version }}
           tags: |
-            ${{ steps.image.outputs.name }}:${{ needs.validate-tag.outputs.version }}
-            ${{ steps.image.outputs.name }}:${{ github.ref_name }}
+            ${{ steps.image.outputs.name }}:${{ needs.release-plan.outputs.version }}
+            ${{ steps.image.outputs.name }}:${{ needs.release-plan.outputs.tag }}
           provenance: mode=max
           sbom: true
 
@@ -193,9 +247,9 @@ jobs:
           registry-username: ${{ github.actor }}
           registry-password: ${{ secrets.GITHUB_TOKEN }}
           format: spdx-json
-          output-file: metrics-agent-${{ github.ref_name }}.spdx.json
+          output-file: metrics-agent-${{ needs.release-plan.outputs.tag }}.spdx.json
           upload-artifact: true
-          artifact-name: metrics-agent-${{ github.ref_name }}-image-sbom
+          artifact-name: metrics-agent-${{ needs.release-plan.outputs.tag }}-image-sbom
           upload-release-assets: false
 
       - name: Attest image SBOM
@@ -203,7 +257,7 @@ jobs:
         with:
           subject-name: ${{ steps.image.outputs.name }}
           subject-digest: ${{ steps.push.outputs.digest }}
-          sbom-path: metrics-agent-${{ github.ref_name }}.spdx.json
+          sbom-path: metrics-agent-${{ needs.release-plan.outputs.tag }}.spdx.json
           push-to-registry: true
 
       - name: Download packaged binaries
@@ -218,7 +272,7 @@ jobs:
         with:
           path: release-assets
           format: spdx-json
-          output-file: release-assets/metrics-agent-${{ github.ref_name }}.spdx.json
+          output-file: release-assets/metrics-agent-${{ needs.release-plan.outputs.tag }}.spdx.json
           upload-artifact: false
 
       - name: Attest release provenance
@@ -230,13 +284,14 @@ jobs:
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
           subject-path: release-assets/*.tar.gz
-          sbom-path: release-assets/metrics-agent-${{ github.ref_name }}.spdx.json
+          sbom-path: release-assets/metrics-agent-${{ needs.release-plan.outputs.tag }}.spdx.json
 
       - name: Publish release
         uses: softprops/action-gh-release@fe965f7af51af5f2602596916f38a38df2e33de0 # v3.0.2
         with:
-          name: metrics-agent ${{ github.ref_name }}
-          tag_name: ${{ github.ref_name }}
+          name: metrics-agent ${{ needs.release-plan.outputs.tag }}
+          tag_name: ${{ needs.release-plan.outputs.tag }}
+          target_commitish: ${{ github.sha }}
           generate_release_notes: true
           files: |
             release-assets/*.tar.gz
