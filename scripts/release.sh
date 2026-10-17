@@ -93,6 +93,31 @@ echo "  New version:     $version"
 echo "  Branch:          $release_branch"
 echo "  Tag after merge: $release_tag"
 
+# Run the release workflow's security gate locally (.github/workflows/release.yml,
+# "Security release gate") before any branch exists, so a known advisory or a
+# leaked secret fails here instead of after the release PR merges. The gate's
+# tests run below, after the version bump.
+for gate_tool in cargo-audit cargo-deny; do
+  if ! command -v "$gate_tool" >/dev/null 2>&1; then
+    echo "Required for the release security gate: $gate_tool. Install it with: cargo install --locked $gate_tool" >&2
+    exit 1
+  fi
+done
+echo "Release security gate: cargo audit"
+cargo audit
+echo "Release security gate: cargo deny"
+cargo deny check --hide-inclusion-graph advisories bans licenses sources
+gitleaks_image="ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f"
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  echo "Release security gate: gitleaks"
+  docker run --rm --volume "${repo_root}:/repo:ro" "$gitleaks_image" git /repo --redact --no-banner
+elif command -v gitleaks >/dev/null 2>&1; then
+  echo "Release security gate: gitleaks"
+  gitleaks git "$repo_root" --redact --no-banner
+else
+  echo "Release security gate: skipping the secret scan locally (Docker and gitleaks are unavailable); the release workflow still runs it." >&2
+fi
+
 if [[ "$dry_run" == "1" ]]; then
   echo "Dry run complete. No files, branches, commits, or pull requests were changed."
   exit 0
