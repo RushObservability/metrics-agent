@@ -321,10 +321,15 @@ version-bump PR:
 make release
 ```
 
-That bumps the patch version in `Cargo.toml` and `Cargo.lock` on a
+It first runs the release workflow's security gate locally: `cargo audit`,
+`cargo deny`, and a gitleaks scan of the history (through Docker or a local
+`gitleaks`). A failure stops the release before any branch is created. Install
+the tools once with `cargo install --locked cargo-audit cargo-deny`.
+
+It then bumps the patch version in `Cargo.toml` and `Cargo.lock` on a
 `release/vX.Y.Z` branch, runs the format, Clippy, and test checks, and opens
-the PR. Pass `VERSION=0.2.0` to choose the version, or `DRY_RUN=1` to print the
-plan without changing anything.
+the PR. Pass `VERSION=0.2.0` to choose the version, or `DRY_RUN=1` to run the
+security gate and print the plan without changing anything.
 
 Merging the PR starts the Release workflow. It runs the security gate, then
 publishes Linux amd64 and arm64 archives, SHA-256 checksums, and a

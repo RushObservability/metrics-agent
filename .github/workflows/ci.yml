@@ -1,11 +1,10 @@
 name: CI
 
+# Pull requests only. A merge to main runs just the release workflow.
 on:
   pull_request:
     types: [opened, synchronize, reopened]
-  push:
-    branches:
-      - '**'
+  workflow_dispatch:
 
 permissions:
   contents: read
