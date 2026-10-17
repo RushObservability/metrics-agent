@@ -1,9 +1,9 @@
 name: Security and quality
 
+# Pull requests, the weekly scan, and manual runs. A merge to main runs just
+# the release workflow, which has its own security gate.
 on:
   pull_request:
-  push:
-    branches: [main]
   schedule:
     - cron: "37 9 * * 1"
   workflow_dispatch:
