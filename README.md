@@ -321,7 +321,7 @@ version-bump PR:
 make release
 ```
 
-It first runs the release workflow's security gate locally: `cargo audit`,
+It first runs the release security gate: `cargo audit`,
 `cargo deny`, and a gitleaks scan of the history (through Docker or a local
 `gitleaks`). A failure stops the release before any branch is created. Install
 the tools once with `cargo install --locked cargo-audit cargo-deny`.
@@ -331,8 +331,8 @@ It then bumps the patch version in `Cargo.toml` and `Cargo.lock` on a
 the PR. Pass `VERSION=0.2.0` to choose the version, or `DRY_RUN=1` to run the
 security gate and print the plan without changing anything.
 
-Merging the PR starts the Release workflow. It runs the security gate, then
-publishes Linux amd64 and arm64 archives, SHA-256 checksums, and a
+Merging the PR starts the Release workflow, which does not repeat the security
+gate. It publishes Linux amd64 and arm64 archives, SHA-256 checksums, and a
 multi-architecture image in GHCR, and creates the `vX.Y.Z` tag and GitHub
 release. Release images use both `0.1.0` and `v0.1.0` tags under
 `ghcr.io/rushobservability/metrics-agent`.
