@@ -13,6 +13,16 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked && \
     cp target/release/metrics-agent /tmp/out-metrics-agent
 
+# Release images: the release workflow puts the binaries it already built in
+# release-assets/, so this stage skips the compile (arm64 under QEMU took an hour).
+FROM ${CHAINGUARD_RUNTIME_IMAGE} AS prebuilt
+ARG TARGETARCH
+ARG VERSION=dev
+LABEL org.opencontainers.image.version=${VERSION}
+COPY --chown=65532:65532 --chmod=0755 release-assets/metrics-agent-${VERSION}-${TARGETARCH} /usr/local/bin/metrics-agent
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/metrics-agent"]
+
 FROM ${CHAINGUARD_RUNTIME_IMAGE}
 ARG VERSION=dev
 LABEL org.opencontainers.image.version=${VERSION}
