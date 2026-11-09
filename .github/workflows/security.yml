@@ -1,7 +1,7 @@
 name: Security and quality
 
 # Pull requests, the weekly scan, and manual runs. A merge to main runs just
-# the release workflow, which has its own security gate.
+# the release workflow; `make release` runs the security gate before the PR.
 on:
   pull_request:
   schedule:

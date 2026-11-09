@@ -93,10 +93,9 @@ echo "  New version:     $version"
 echo "  Branch:          $release_branch"
 echo "  Tag after merge: $release_tag"
 
-# Run the release workflow's security gate locally (.github/workflows/release.yml,
-# "Security release gate") before any branch exists, so a known advisory or a
-# leaked secret fails here instead of after the release PR merges. The gate's
-# tests run below, after the version bump.
+# Run the release security gate before any branch exists, so a known advisory or
+# a leaked secret stops the release here. The release workflow does not repeat
+# it; the tests run below, after the version bump.
 for gate_tool in cargo-audit cargo-deny; do
   if ! command -v "$gate_tool" >/dev/null 2>&1; then
     echo "Required for the release security gate: $gate_tool. Install it with: cargo install --locked $gate_tool" >&2
@@ -115,7 +114,7 @@ elif command -v gitleaks >/dev/null 2>&1; then
   echo "Release security gate: gitleaks"
   gitleaks git "$repo_root" --redact --no-banner
 else
-  echo "Release security gate: skipping the secret scan locally (Docker and gitleaks are unavailable); the release workflow still runs it." >&2
+  echo "Release security gate: skipping the secret scan locally (Docker and gitleaks are unavailable); the release PR's security workflow still runs it." >&2
 fi
 
 if [[ "$dry_run" == "1" ]]; then
@@ -205,7 +204,7 @@ pr_url="$(
     --base main \
     --head "$release_branch" \
     --title "Release $release_tag" \
-    --body "Updates the metrics-agent Cargo package version to $version. After this PR merges, the release workflow will run the security gate, publish the binaries and image, create $release_tag, and generate release notes from merged pull requests."
+    --body "Updates the metrics-agent Cargo package version to $version. After this PR merges, the release workflow will publish the binaries and image, create $release_tag, and generate release notes from merged pull requests."
 )"
 
 echo "Release PR created: $pr_url"
