@@ -32,6 +32,13 @@ use crate::{
     status::{MetricCardinality, ScrapeStatus},
 };
 
+mod internal_target;
+
+/// Reject incomplete internal scrape configuration before starting workers.
+pub fn validate_internal_metrics(config: &crate::config::Config) -> Result<()> {
+    internal_target::target(config).map(|_| ())
+}
+
 #[derive(Clone, Debug)]
 struct TargetIdentity {
     key: String,
@@ -193,6 +200,13 @@ async fn scrape_once(
             controller.config().scrape_discovery_refresh_interval,
         )
         .await?;
+    let targets = if let Some(target) = internal_target::target(controller.config())? {
+        let mut combined = targets.to_vec();
+        combined.push(target);
+        Arc::<[ScrapeTarget]>::from(combined)
+    } else {
+        targets
+    };
     let limits = ScrapeLimits {
         max_response_bytes: controller.config().scrape_max_response_bytes,
         max_retained_bytes: controller.config().scrape_max_retained_bytes,
@@ -213,18 +227,20 @@ async fn scrape_once(
         async move {
             let target = &targets[index];
             let identity = &target.identity;
-            if !namespace_allowed(
-                &identity.namespace,
-                &controller.config().scrape_allowed_namespaces,
-            ) {
+            if !internal_target::is_internal(target)
+                && !namespace_allowed(
+                    &identity.namespace,
+                    &controller.config().scrape_allowed_namespaces,
+                )
+            {
                 bail!("scrape source namespace is not allowed");
             }
             let url = validate_scrape_url(
                 &target.url,
                 &controller.config().scrape_allowed_destinations,
             )?;
-            let response = http
-                .get(url)
+            let response = internal_target::request(http, target, url, controller.config())
+                .await?
                 .send()
                 .await
                 .map_err(|_| anyhow::anyhow!("scrape request failed"))?;

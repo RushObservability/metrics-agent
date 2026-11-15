@@ -8,13 +8,14 @@ use tracing::{error, info};
 use metrics_agent::{
     config::{Config, configure_logging},
     controller::Controller,
-    http, remote_write,
+    http, remote_write, scraper,
 };
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::parse();
     configure_logging(&config.log_level);
+    scraper::validate_internal_metrics(&config)?;
     info!(version = %config.agent_version, http_address = %config.http_address, ui_enabled = config.ui_enabled, ui_address = %config.ui_address, "starting metrics-agent");
     if config.ui_enabled {
         info!(path = %config.ui_path, "embedded metrics-agent UI enabled");
