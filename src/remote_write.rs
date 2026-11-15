@@ -152,6 +152,7 @@ pub async fn publish(
             tenant,
             extra_labels,
             include_self: true,
+            delivery: crate::delivery_metrics::global(),
         },
     )
     .await
@@ -162,6 +163,7 @@ struct PublishOptions<'a> {
     tenant: Option<&'a str>,
     extra_labels: &'a BTreeMap<String, String>,
     include_self: bool,
+    delivery: &'a crate::delivery_metrics::DeliveryMetrics,
 }
 
 async fn publish_inner(
@@ -171,6 +173,7 @@ async fn publish_inner(
     scraped: Vec<CollectedMetric>,
     options: PublishOptions<'_>,
 ) -> Result<PublishResult> {
+    let mut attempt = options.delivery.attempt(scraped.len());
     let snapshot = snapshot.cloned();
     let extra_labels = options.extra_labels.clone();
     let include_self = options.include_self;
@@ -182,7 +185,9 @@ async fn publish_inner(
         Ok::<_, anyhow::Error>((payload, compressed))
     })
     .await
-    .context("join remote-write encoding task")??;
+    .inspect_err(|_| attempt.finish("encode_error"))
+    .context("join remote-write encoding task")?
+    .inspect_err(|_| attempt.finish("encode_error"))?;
 
     let mut request = client
         .post(url)
@@ -196,12 +201,31 @@ async fn publish_inner(
     if let Some(tenant) = options.tenant.filter(|tenant| !tenant.is_empty()) {
         request = request.header("X-Rush-Tenant", tenant);
     }
-    let response = request.send().await.context("send remote-write payload")?;
+    attempt.finish("cancelled");
+    let response = request
+        .send()
+        .await
+        .inspect_err(|error| {
+            attempt.finish(if error.is_timeout() {
+                "timeout"
+            } else {
+                "transport_error"
+            });
+        })
+        .context("send remote-write payload")?;
     if !response.status().is_success() {
         let status = response.status();
+        attempt.finish(if status.is_client_error() {
+            "http_4xx"
+        } else if status.is_server_error() {
+            "http_5xx"
+        } else {
+            "http_other"
+        });
         return Err(anyhow!("Rush rejected remote-write payload: HTTP {status}"));
     }
 
+    attempt.finish("success");
     Ok(PublishResult {
         series: payload.series,
         samples: payload.samples,
@@ -693,7 +717,7 @@ fn parse_labels_bounded(raw: &str, limits: ScrapeLimits) -> Result<Vec<Label>> {
 pub async fn run(
     client: reqwest::Client,
     status: Arc<crate::status::StatusStore>,
-    mut scrape_receiver: tokio::sync::mpsc::Receiver<ScrapeMessage>,
+    scrape_receiver: tokio::sync::mpsc::Receiver<ScrapeMessage>,
     url: Option<String>,
     token: Option<String>,
     tenant: Option<String>,
@@ -701,6 +725,38 @@ pub async fn run(
     interval: std::time::Duration,
     shutdown: tokio_util::sync::CancellationToken,
 ) {
+    run_with_metrics(
+        client,
+        status,
+        scrape_receiver,
+        url,
+        token,
+        tenant,
+        extra_labels,
+        interval,
+        shutdown,
+        crate::delivery_metrics::global(),
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_with_metrics(
+    client: reqwest::Client,
+    status: Arc<crate::status::StatusStore>,
+    scrape_receiver: tokio::sync::mpsc::Receiver<ScrapeMessage>,
+    url: Option<String>,
+    token: Option<String>,
+    tenant: Option<String>,
+    extra_labels: BTreeMap<String, String>,
+    interval: std::time::Duration,
+    shutdown: tokio_util::sync::CancellationToken,
+    delivery: &crate::delivery_metrics::DeliveryMetrics,
+) {
+    let mut scrape_receiver = crate::delivery_metrics::Receiver {
+        inner: scrape_receiver,
+        metrics: delivery,
+    };
     let mut interval = tokio::time::interval(interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut cycle_active = false;
@@ -712,7 +768,7 @@ pub async fn run(
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return,
-            message = scrape_receiver.recv() => {
+            message = scrape_receiver.inner.recv() => {
                 let Some(message) = message else { return };
                 match message {
                     ScrapeMessage::Start { .. } => {
@@ -724,8 +780,8 @@ pub async fn run(
                         cycle_error = None;
                     }
                     ScrapeMessage::Batch(metrics) => {
-                        let Some(url) = url.as_deref() else { continue };
-                        if cycle_error.is_some() { continue; }
+                        let Some(url) = url.as_deref() else { delivery.discarded(metrics.len(), "disabled"); continue };
+                        if cycle_error.is_some() { delivery.discarded(metrics.len(), "prior_chunk_failed"); continue; }
                         let snapshot = if cycle_sent_self {
                             None
                         } else {
@@ -741,6 +797,7 @@ pub async fn run(
                                 tenant: tenant.as_deref(),
                                 extra_labels: &extra_labels,
                                 include_self: !cycle_sent_self,
+                                delivery,
                             },
                         ).await {
                             Ok(result) => {
@@ -769,6 +826,7 @@ pub async fn run(
                                         tenant: tenant.as_deref(),
                                         extra_labels: &extra_labels,
                                         include_self: true,
+                                        delivery,
                                     },
                                 ).await {
                                     Ok(result) => {
@@ -817,6 +875,7 @@ pub async fn run(
                                 tenant: tenant.as_deref(),
                                 extra_labels: &extra_labels,
                                 include_self: true,
+                                        delivery,
                             },
                         ).await {
                             Ok(result) => status.set_remote_write_result(Some(result.series), Some(result.samples), timestamp, started.elapsed().as_millis() as u64, None).await,
@@ -1359,5 +1418,108 @@ request_total{job="scrape",path="a\\b\"c\n",code="200"} 3.5 1700000000123
                     .any(|label| label.name == "cluster" && label.value == "ntt-japan")
             );
         }
+    }
+    #[tokio::test]
+    async fn failed_chunk_counts_skipped_samples_and_next_cycle_recovers() {
+        use axum::{Router, http::StatusCode};
+        use std::{
+            sync::{
+                Arc,
+                atomic::{AtomicUsize, Ordering},
+            },
+            time::Duration,
+        };
+        let hits = Arc::new(AtomicUsize::new(0));
+        let requests = hits.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(move || {
+                    let requests = requests.clone();
+                    async move {
+                        if requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                            StatusCode::SERVICE_UNAVAILABLE
+                        } else {
+                            StatusCode::OK
+                        }
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        });
+        let status = crate::status::StatusStore::new("test", false, "", "/ui/", Some(url.clone()));
+        status
+            .set_scrape_status(ScrapeStatus {
+                enabled: true,
+                targets: 1,
+                ..Default::default()
+            })
+            .await;
+        let (tx, rx) = tokio::sync::mpsc::channel(10);
+        let sample = || {
+            super::parse_prometheus_text("workload 1\n", &[], 1, ScrapeLimits::default()).unwrap()
+        };
+        tx.send(super::ScrapeMessage::Start { targets: 1 })
+            .await
+            .unwrap();
+        tx.send(super::ScrapeMessage::Batch(sample()))
+            .await
+            .unwrap();
+        tx.send(super::ScrapeMessage::Batch(sample()))
+            .await
+            .unwrap();
+        tx.send(super::ScrapeMessage::Complete {
+            targets: 1,
+            healthy_targets: 1,
+            samples: 2,
+            error: None,
+        })
+        .await
+        .unwrap();
+        tx.send(super::ScrapeMessage::Start { targets: 1 })
+            .await
+            .unwrap();
+        tx.send(super::ScrapeMessage::Batch(sample()))
+            .await
+            .unwrap();
+        tx.send(super::ScrapeMessage::Complete {
+            targets: 1,
+            healthy_targets: 1,
+            samples: 1,
+            error: None,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+        let metrics = crate::delivery_metrics::DeliveryMetrics::default();
+        super::run_with_metrics(
+            super::http_client(Duration::from_secs(1), Duration::from_secs(1)).unwrap(),
+            status,
+            rx,
+            Some(url),
+            None,
+            None,
+            BTreeMap::new(),
+            Duration::from_secs(3600),
+            tokio_util::sync::CancellationToken::new(),
+            &metrics,
+        )
+        .await;
+        let rendered = metrics.0.render();
+        assert!(
+            rendered.contains("requests_total{outcome=\"http_5xx\"} 1"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("samples_total{outcome=\"discarded\"} 2"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("reason=\"prior_chunk_failed\"} 1"));
+        assert!(rendered.contains("samples_total{outcome=\"sent\"} 1"));
+        assert!(hits.load(Ordering::SeqCst) >= 2);
+        server.abort();
     }
 }
