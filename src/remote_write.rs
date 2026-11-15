@@ -413,7 +413,10 @@ pub fn parse_prometheus_text(
     limits: ScrapeLimits,
 ) -> Result<Vec<CollectedMetric>> {
     if body.len() > limits.max_response_bytes {
-        bail!("scrape response exceeds the configured byte limit");
+        return Err(crate::scrape_metrics::ResourceLimit(
+            "scrape response exceeds the configured byte limit",
+        )
+        .into());
     }
     let mut parser = PrometheusTextParser::new(target_labels, default_timestamp, limits)?;
     for line in body.lines() {
@@ -446,7 +449,10 @@ impl PrometheusTextParser {
             .map(|(name, value)| name.len() + value.len() + std::mem::size_of::<(String, String)>())
             .sum::<usize>();
         if retained_bytes > limits.max_retained_bytes {
-            bail!("decoded scrape exceeds the configured retained-byte limit");
+            return Err(crate::scrape_metrics::ResourceLimit(
+                "decoded scrape exceeds the configured retained-byte limit",
+            )
+            .into());
         }
         Ok(Self {
             target_labels: target_labels.to_vec(),
@@ -461,14 +467,20 @@ impl PrometheusTextParser {
 
     pub fn push_line(&mut self, line: &str) -> Result<()> {
         if line.len() > self.limits.max_line_bytes {
-            bail!("Prometheus exposition line exceeds the configured byte limit");
+            return Err(crate::scrape_metrics::ResourceLimit(
+                "Prometheus exposition line exceeds the configured byte limit",
+            )
+            .into());
         }
         if let Some(help) = line.strip_prefix("# HELP ") {
             let mut fields = help.splitn(2, ' ');
             if let (Some(name), Some(description)) = (fields.next(), fields.next()) {
                 validate_metric_name(name, self.limits)?;
                 if description.len() > self.limits.max_label_value_bytes {
-                    bail!("Prometheus HELP text exceeds the configured byte limit");
+                    return Err(crate::scrape_metrics::ResourceLimit(
+                        "Prometheus HELP text exceeds the configured byte limit",
+                    )
+                    .into());
                 }
                 let old = self
                     .helps
@@ -509,7 +521,10 @@ impl PrometheusTextParser {
             .unwrap_or(self.default_timestamp);
         let (name, labels) = parse_metric_bounded(metric, self.limits)?;
         if self.samples.len() >= self.limits.max_samples_per_target {
-            bail!("scrape target exceeds the configured sample limit");
+            return Err(crate::scrape_metrics::ResourceLimit(
+                "scrape target exceeds the configured sample limit",
+            )
+            .into());
         }
         let mut merged = self.target_labels.clone();
         for label in labels {
@@ -517,7 +532,10 @@ impl PrometheusTextParser {
                 existing.1 = label.value;
             } else {
                 if merged.len() >= self.limits.max_labels_per_sample {
-                    bail!("Prometheus sample exceeds the configured label-count limit");
+                    return Err(crate::scrape_metrics::ResourceLimit(
+                        "Prometheus sample exceeds the configured label-count limit",
+                    )
+                    .into());
                 }
                 merged.push((label.name, label.value));
             }
@@ -543,12 +561,17 @@ impl PrometheusTextParser {
     }
 
     fn charge_retained(&mut self, bytes: usize) -> Result<()> {
-        let total = self
-            .retained_bytes
-            .checked_add(bytes)
-            .context("decoded scrape size overflow")?;
+        let total =
+            self.retained_bytes
+                .checked_add(bytes)
+                .ok_or(crate::scrape_metrics::ResourceLimit(
+                    "decoded scrape size overflow",
+                ))?;
         if total > self.limits.max_retained_bytes {
-            bail!("decoded scrape exceeds the configured retained-byte limit");
+            return Err(crate::scrape_metrics::ResourceLimit(
+                "decoded scrape exceeds the configured retained-byte limit",
+            )
+            .into());
         }
         self.retained_bytes = total;
         Ok(())
@@ -575,7 +598,10 @@ impl PrometheusTextParser {
 
 fn validate_target_labels(target_labels: &[(String, String)], limits: ScrapeLimits) -> Result<()> {
     if target_labels.len() > limits.max_labels_per_sample {
-        bail!("scrape target labels exceed the configured label-count limit");
+        return Err(crate::scrape_metrics::ResourceLimit(
+            "scrape target labels exceed the configured label-count limit",
+        )
+        .into());
     }
     let mut names = HashSet::with_capacity(target_labels.len());
     for (name, value) in target_labels {
@@ -583,10 +609,16 @@ fn validate_target_labels(target_labels: &[(String, String)], limits: ScrapeLimi
             bail!("scrape target labels contain a duplicate name");
         }
         if name.len() > limits.max_label_name_bytes {
-            bail!("scrape target label name exceeds the configured byte limit");
+            return Err(crate::scrape_metrics::ResourceLimit(
+                "scrape target label name exceeds the configured byte limit",
+            )
+            .into());
         }
         if value.len() > limits.max_label_value_bytes {
-            bail!("scrape target label value exceeds the configured byte limit");
+            return Err(crate::scrape_metrics::ResourceLimit(
+                "scrape target label value exceeds the configured byte limit",
+            )
+            .into());
         }
     }
     Ok(())
@@ -597,7 +629,10 @@ fn validate_metric_name(name: &str, limits: ScrapeLimits) -> Result<()> {
         bail!("Prometheus metric name is empty");
     }
     if name.len() > limits.max_metric_name_bytes {
-        bail!("Prometheus metric name exceeds the configured byte limit");
+        return Err(crate::scrape_metrics::ResourceLimit(
+            "Prometheus metric name exceeds the configured byte limit",
+        )
+        .into());
     }
     Ok(())
 }
@@ -647,7 +682,10 @@ fn parse_labels_bounded(raw: &str, limits: ScrapeLimits) -> Result<Vec<Label>> {
             return Err(anyhow!("invalid Prometheus label set"));
         }
         if key.len() > limits.max_label_name_bytes {
-            bail!("Prometheus label name exceeds the configured byte limit");
+            return Err(crate::scrape_metrics::ResourceLimit(
+                "Prometheus label name exceeds the configured byte limit",
+            )
+            .into());
         }
         if !names.insert(key) {
             bail!("Prometheus sample contains a duplicate label name");
@@ -678,7 +716,10 @@ fn parse_labels_bounded(raw: &str, limits: ScrapeLimits) -> Result<Vec<Label>> {
                         _ => bail!("Prometheus label value contains an invalid escape"),
                     };
                     if value.len() + character.len_utf8() > limits.max_label_value_bytes {
-                        bail!("Prometheus label value exceeds the configured byte limit");
+                        return Err(crate::scrape_metrics::ResourceLimit(
+                            "Prometheus label value exceeds the configured byte limit",
+                        )
+                        .into());
                     }
                     value.push(character);
                     cursor += 1;
@@ -689,7 +730,10 @@ fn parse_labels_bounded(raw: &str, limits: ScrapeLimits) -> Result<Vec<Label>> {
                         .next()
                         .context("invalid UTF-8 boundary in Prometheus label value")?;
                     if value.len() + character.len_utf8() > limits.max_label_value_bytes {
-                        bail!("Prometheus label value exceeds the configured byte limit");
+                        return Err(crate::scrape_metrics::ResourceLimit(
+                            "Prometheus label value exceeds the configured byte limit",
+                        )
+                        .into());
                     }
                     value.push(character);
                     cursor += character.len_utf8();
@@ -700,7 +744,10 @@ fn parse_labels_bounded(raw: &str, limits: ScrapeLimits) -> Result<Vec<Label>> {
             return Err(anyhow!("Prometheus label value is not closed"));
         }
         if labels.len() >= limits.max_labels_per_sample {
-            bail!("Prometheus sample exceeds the configured label-count limit");
+            return Err(crate::scrape_metrics::ResourceLimit(
+                "Prometheus sample exceeds the configured label-count limit",
+            )
+            .into());
         }
         labels.push(Label {
             name: key.to_string(),

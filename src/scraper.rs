@@ -154,12 +154,14 @@ pub async fn run(
             _ = interval.tick() => {
                 controller.status.begin_scrape().await;
                 let started = Instant::now();
+                let mut cycle = crate::scrape_metrics::Cycle::default();
                 let result = scrape_once(&controller, &http, &sender, &mut target_cache).await;
                 let duration_ms = started.elapsed().as_millis() as u64;
                 let timestamp = chrono::Utc::now().to_rfc3339();
                 match result {
                     Ok((targets, healthy, samples, discovery_duration_ms, discovery_cache_hit)) => {
                         if healthy == targets { crate::worker_metrics::success("scrape"); }
+                        cycle.outcome = if healthy == targets { "complete" } else if healthy == 0 { "failed" } else { "partial" };
                         controller.status.set_scrape_status(ScrapeStatus {
                             enabled: true,
                             targets: targets as u64,
@@ -174,6 +176,7 @@ pub async fn run(
                         }).await;
                     }
                     Err(error) => {
+                        cycle.outcome = "failed";
                         let _ = sender
                             .send(ScrapeMessage::Complete {
                                 targets: 0,
@@ -246,38 +249,11 @@ async fn scrape_once(
         let targets = Arc::clone(&targets);
         async move {
             let target = &targets[index];
-            let identity = &target.identity;
-            if !internal_target::is_internal(target)
-                && !namespace_allowed(
-                    &identity.namespace,
-                    &controller.config().scrape_allowed_namespaces,
-                )
-            {
-                bail!("scrape source namespace is not allowed");
-            }
-            let url = validate_scrape_url(
-                &target.url,
-                &controller.config().scrape_allowed_destinations,
-            )?;
-            let response = internal_target::request(http, target, url, controller.config())
-                .await?
-                .send()
-                .await
-                .map_err(|_| anyhow::anyhow!("scrape request failed"))?;
-            if response.status().is_redirection() {
-                bail!("scrape redirects are disabled");
-            }
-            if !response.status().is_success() {
-                bail!("scrape returned HTTP {}", response.status());
-            }
-            let metrics = parse_bounded_response(
-                response,
-                &target.labels,
-                chrono::Utc::now().timestamp_millis(),
-                limits,
-            )
-            .await?;
-            Ok::<_, anyhow::Error>((index, metrics))
+            let mut attempt =
+                crate::scrape_metrics::Attempt::new(&target.identity.pair, &target.identity.source);
+            let result = fetch_target(http, target, controller.config(), limits).await;
+            attempt.finish(&result);
+            result.map(|metrics| (index, metrics))
         }
     }))
     .buffer_unordered(controller.config().scrape_concurrency);
@@ -309,7 +285,12 @@ async fn scrape_once(
                     .await;
                 samples += send_metric_chunks(sender, metrics).await?;
             }
-            Err(error) => debug!(reason = target_error_key(&error), "scrape target failed"),
+            Err(error) => debug!(
+                reason = error
+                    .downcast_ref::<crate::scrape_metrics::Failure>()
+                    .map_or("parse_error", |failure| failure.0.label()),
+                "scrape target failed"
+            ),
         }
     }
     sender
@@ -330,19 +311,58 @@ async fn scrape_once(
     ))
 }
 
-fn target_error_key(error: &anyhow::Error) -> &'static str {
-    let message = error.to_string();
-    if message.contains("namespace") {
-        "namespace_denied"
-    } else if message.contains("destination") || message.contains("URL") {
-        "destination_denied"
-    } else if message.contains("redirect") {
-        "redirect_denied"
-    } else if message.contains("too large") || message.contains("limit") {
-        "resource_limit"
-    } else {
-        "request_failed"
+async fn fetch_target(
+    http: &reqwest::Client,
+    target: &ScrapeTarget,
+    config: &crate::config::Config,
+    limits: ScrapeLimits,
+) -> Result<Vec<CollectedMetric>> {
+    use crate::scrape_metrics::{Failure, Outcome, ResourceLimit};
+    if !internal_target::is_internal(target)
+        && !namespace_allowed(
+            &target.identity.namespace,
+            &config.scrape_allowed_namespaces,
+        )
+    {
+        return Err(Failure(Outcome::PolicyDenied).into());
     }
+    let url = validate_scrape_url(&target.url, &config.scrape_allowed_destinations)
+        .context(Failure(Outcome::PolicyDenied))?;
+    let request = internal_target::request(http, target, url, config)
+        .await
+        .context(Failure(Outcome::ConfigError))?;
+    let response = request.send().await.map_err(|error| {
+        let outcome = if error.is_timeout() {
+            Outcome::Timeout
+        } else {
+            Outcome::TransportError
+        };
+        anyhow::Error::new(error).context(Failure(outcome))
+    })?;
+    if !response.status().is_success() {
+        return Err(Failure(Outcome::HttpError).into());
+    }
+    parse_bounded_response(
+        response,
+        &target.labels,
+        chrono::Utc::now().timestamp_millis(),
+        limits,
+    )
+    .await
+    .map_err(|error| {
+        let outcome = if error.downcast_ref::<ResourceLimit>().is_some() {
+            Outcome::ResourceLimit
+        } else if let Some(error) = error.downcast_ref::<reqwest::Error>() {
+            if error.is_timeout() {
+                Outcome::Timeout
+            } else {
+                Outcome::TransportError
+            }
+        } else {
+            Outcome::ParseError
+        };
+        error.context(Failure(outcome))
+    })
 }
 
 fn namespace_allowed(namespace: &str, allowed: &[String]) -> bool {
@@ -504,7 +524,10 @@ async fn parse_bounded_response(
         .content_length()
         .is_some_and(|length| length > limits.max_response_bytes as u64)
     {
-        bail!("scrape response exceeds the configured byte limit");
+        return Err(crate::scrape_metrics::ResourceLimit(
+            "scrape response exceeds the configured byte limit",
+        )
+        .into());
     }
     let mut parser = BoundedTextParser::new(target_labels, default_timestamp, limits)?;
     let mut chunks = response.bytes_stream();
@@ -565,7 +588,10 @@ impl BoundedTextParser {
             self.pending.drain(..consumed);
         }
         if self.pending.len() > self.limits.max_line_bytes {
-            bail!("Prometheus exposition line exceeds the configured byte limit");
+            return Err(crate::scrape_metrics::ResourceLimit(
+                "Prometheus exposition line exceeds the configured byte limit",
+            )
+            .into());
         }
         Ok(())
     }
@@ -582,7 +608,10 @@ impl BoundedTextParser {
 
 fn account_response_bytes(total: &mut usize, chunk_bytes: usize, max_bytes: usize) -> Result<()> {
     if chunk_bytes > max_bytes.saturating_sub(*total) {
-        bail!("scrape response exceeds the configured byte limit");
+        return Err(crate::scrape_metrics::ResourceLimit(
+            "scrape response exceeds the configured byte limit",
+        )
+        .into());
     }
     *total += chunk_bytes;
     Ok(())
@@ -1723,6 +1752,87 @@ mod tests {
                 .await
                 .is_err()
         );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn scrape_failures_are_typed_and_internal_source_is_bounded() {
+        use axum::{
+            Router,
+            http::{StatusCode, Uri},
+        };
+        use clap::Parser;
+        use std::time::Duration;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(|uri: Uri| async move {
+                    match uri.path() {
+                        "/http" => (StatusCode::FORBIDDEN, "denied"),
+                        "/limit" => (StatusCode::OK, "large_response 100"),
+                        "/parse" => (StatusCode::OK, "m{a=bad} 1"),
+                        "/timeout" => {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            (StatusCode::OK, "m 1")
+                        }
+                        _ => (StatusCode::OK, "m 1"),
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        });
+        let mut config = crate::config::Config::parse_from(["test"]);
+        config.scrape_allowed_destinations = vec!["127.0.0.1".into()];
+        let http =
+            super::scrape_client(Duration::from_millis(30), vec!["127.0.0.1".into()]).unwrap();
+        for (path, expected, max_bytes) in [
+            ("/http", "http_error", 100),
+            ("/limit", "resource_limit", 3),
+            ("/parse", "parse_error", 100),
+            ("/timeout", "timeout", 100),
+        ] {
+            let target = ScrapeTarget {
+                url: format!("{endpoint}{path}"),
+                labels: vec![],
+                identity: identity("service-monitor", "prometheus"),
+            };
+            let mut attempt =
+                crate::scrape_metrics::Attempt::new(&target.identity.pair, &target.identity.source);
+            let result = super::fetch_target(
+                &http,
+                &target,
+                &config,
+                ScrapeLimits {
+                    max_response_bytes: max_bytes,
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert_eq!(
+                result
+                    .as_ref()
+                    .unwrap_err()
+                    .downcast_ref::<crate::scrape_metrics::Failure>()
+                    .unwrap()
+                    .0
+                    .label(),
+                expected
+            );
+            attempt.finish(&result);
+        }
+        drop(crate::scrape_metrics::Attempt::new("internal", "internal"));
+        drop(crate::scrape_metrics::Attempt::new(
+            "arbitrary-name",
+            "arbitrary-source",
+        ));
+        let metrics = crate::scrape_metrics::registry().render();
+        assert!(
+            metrics
+                .contains("resource_pair=\"internal\",source=\"internal\",outcome=\"cancelled\"")
+        );
+        assert!(!metrics.contains("arbitrary-name"));
         server.abort();
     }
 }
