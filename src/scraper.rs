@@ -154,14 +154,12 @@ pub async fn run(
             _ = interval.tick() => {
                 controller.status.begin_scrape().await;
                 let started = Instant::now();
-                let mut cycle = crate::scrape_metrics::Cycle::default();
                 let result = scrape_once(&controller, &http, &sender, &mut target_cache).await;
                 let duration_ms = started.elapsed().as_millis() as u64;
                 let timestamp = chrono::Utc::now().to_rfc3339();
                 match result {
                     Ok((targets, healthy, samples, discovery_duration_ms, discovery_cache_hit)) => {
                         if healthy == targets { crate::worker_metrics::success("scrape"); }
-                        cycle.outcome = if healthy == targets { "complete" } else if healthy == 0 { "failed" } else { "partial" };
                         controller.status.set_scrape_status(ScrapeStatus {
                             enabled: true,
                             targets: targets as u64,
@@ -176,7 +174,6 @@ pub async fn run(
                         }).await;
                     }
                     Err(error) => {
-                        cycle.outcome = "failed";
                         let _ = sender
                             .send(ScrapeMessage::Complete {
                                 targets: 0,
@@ -216,6 +213,23 @@ async fn scrape_once(
     sender: &mpsc::Sender<ScrapeMessage>,
     target_cache: &mut TargetCache,
 ) -> Result<(usize, usize, u64, u64, bool)> {
+    let mut cycle = crate::scrape_metrics::Cycle::default();
+    let result = scrape_once_inner(controller, http, sender, target_cache).await;
+    cycle.outcome = match &result {
+        Ok((targets, healthy, ..)) if targets == healthy => "complete",
+        Ok((_, 0, ..)) => "failed",
+        Ok(_) => "partial",
+        Err(_) => "failed",
+    };
+    result
+}
+
+async fn scrape_once_inner(
+    controller: &Controller,
+    http: &reqwest::Client,
+    sender: &mpsc::Sender<ScrapeMessage>,
+    target_cache: &mut TargetCache,
+) -> Result<(usize, usize, u64, u64, bool)> {
     let (targets, discovery_duration_ms, discovery_cache_hit) = target_cache
         .get(
             controller.kube_client(),
@@ -225,6 +239,11 @@ async fn scrape_once(
         .await?;
     let internal = internal_target::targets(controller.config(), controller.kube_client()).await;
     let (targets, unavailable_internal_sources) = internal_target::combine(targets, internal);
+    crate::scrape_metrics::registry().counter(
+        "metrics_agent_internal_discovery_failures_total",
+        &[],
+        unavailable_internal_sources as u64,
+    );
     let limits = ScrapeLimits {
         max_response_bytes: controller.config().scrape_max_response_bytes,
         max_retained_bytes: controller.config().scrape_max_retained_bytes,

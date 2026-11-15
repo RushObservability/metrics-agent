@@ -579,6 +579,9 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!((targets, healthy, samples), (2, 1, 1));
+        let metrics = crate::scrape_metrics::registry().render();
+        assert!(metrics.contains("metrics_agent_scrape_cycles_total{outcome=\"partial\"}"));
+        assert!(metrics.contains("metrics_agent_internal_discovery_failures_total"));
         assert!(matches!(
             receiver.recv().await,
             Some(crate::remote_write::ScrapeMessage::Start { targets: 2 })
@@ -597,6 +600,20 @@ mod tests {
                 ..
             })
         ));
+
+        // An unresolved internal source with no other workloads is failed, not a
+        // successful empty cycle, and still produces no phantom HTTP request.
+        cache.targets = Vec::new().into();
+        let (targets, healthy, samples, _, _) =
+            scrape_once(&controller, &http, &sender, &mut cache)
+                .await
+                .unwrap();
+        assert_eq!((targets, healthy, samples), (1, 0, 0));
+        assert!(
+            crate::scrape_metrics::registry()
+                .render()
+                .contains("metrics_agent_scrape_cycles_total{outcome=\"failed\"}")
+        );
         task.abort();
     }
 }
