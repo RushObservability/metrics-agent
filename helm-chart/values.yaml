@@ -130,6 +130,18 @@ status:
 selfMetrics:
   enabled: false
 
+# Authenticated SRE health collection, configured independently of CRD targets.
+sreMetrics:
+  enabled: false
+  url: ""
+  tokenSecret:
+    name: ""
+    key: sre-agent-internal-token
+  discovery:
+    enabled: false
+    serviceName: ""
+    namespace: ""
+
 # Additional non-secret environment variables for the metrics-agent container.
 env: []
 

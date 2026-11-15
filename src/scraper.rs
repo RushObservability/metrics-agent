@@ -32,6 +32,13 @@ use crate::{
     status::{MetricCardinality, ScrapeStatus},
 };
 
+mod internal_target;
+
+/// Reject incomplete internal scrape configuration before starting workers.
+pub fn validate_internal_metrics(config: &crate::config::Config) -> Result<()> {
+    internal_target::target(config).map(|_| ())
+}
+
 #[derive(Clone, Debug)]
 struct TargetIdentity {
     key: String,
@@ -72,12 +79,20 @@ impl TargetCache {
             .refreshed_at
             .is_some_and(|refreshed_at| refreshed_at.elapsed() < refresh_interval);
         if fresh {
+            crate::discovery_metrics::cache(
+                "fresh",
+                self.refreshed_at
+                    .map_or(0.0, |at| at.elapsed().as_secs_f64()),
+            );
             return Ok((Arc::clone(&self.targets), 0, true));
         }
 
         let started = Instant::now();
         match discover_targets(client, pairs).await {
             Ok(targets) => {
+                crate::discovery_metrics::refresh("complete");
+                crate::worker_metrics::success("discovery");
+                crate::discovery_metrics::cache("refreshed", 0.0);
                 let duration_ms = started.elapsed().as_millis() as u64;
                 let targets: Arc<[ScrapeTarget]> = targets.into();
                 self.targets = Arc::clone(&targets);
@@ -85,11 +100,22 @@ impl TargetCache {
                 Ok((targets, duration_ms, false))
             }
             Err(error) => {
+                crate::discovery_metrics::refresh("failed");
+                crate::discovery_metrics::cache(
+                    "refresh_failed",
+                    self.refreshed_at
+                        .map_or(0.0, |at| at.elapsed().as_secs_f64()),
+                );
                 let stale_allowed = self.refreshed_at.is_some_and(|refreshed_at| {
                     refreshed_at.elapsed()
                         < refresh_interval.checked_mul(2).unwrap_or(Duration::MAX)
                 });
                 if stale_allowed && !self.targets.is_empty() {
+                    crate::discovery_metrics::cache(
+                        "stale",
+                        self.refreshed_at
+                            .map_or(0.0, |at| at.elapsed().as_secs_f64()),
+                    );
                     warn!(%error, "scrape target refresh failed; using bounded stale discovery data");
                     Ok((
                         Arc::clone(&self.targets),
@@ -133,6 +159,7 @@ pub async fn run(
                 let timestamp = chrono::Utc::now().to_rfc3339();
                 match result {
                     Ok((targets, healthy, samples, discovery_duration_ms, discovery_cache_hit)) => {
+                        if healthy == targets { crate::worker_metrics::success("scrape"); }
                         controller.status.set_scrape_status(ScrapeStatus {
                             enabled: true,
                             targets: targets as u64,
@@ -147,8 +174,8 @@ pub async fn run(
                         }).await;
                     }
                     Err(error) => {
-                        let _ = sender
-                            .send(ScrapeMessage::Complete {
+                        let _ = crate::queue_metrics::publish(&sender,
+                            ScrapeMessage::Complete {
                                 targets: 0,
                                 healthy_targets: 0,
                                 samples: 0,
@@ -186,6 +213,23 @@ async fn scrape_once(
     sender: &mpsc::Sender<ScrapeMessage>,
     target_cache: &mut TargetCache,
 ) -> Result<(usize, usize, u64, u64, bool)> {
+    let mut cycle = crate::scrape_metrics::Cycle::default();
+    let result = scrape_once_inner(controller, http, sender, target_cache).await;
+    cycle.outcome = match &result {
+        Ok((targets, healthy, ..)) if targets == healthy => "complete",
+        Ok((_, 0, ..)) => "failed",
+        Ok(_) => "partial",
+        Err(_) => "failed",
+    };
+    result
+}
+
+async fn scrape_once_inner(
+    controller: &Controller,
+    http: &reqwest::Client,
+    sender: &mpsc::Sender<ScrapeMessage>,
+    target_cache: &mut TargetCache,
+) -> Result<(usize, usize, u64, u64, bool)> {
     let (targets, discovery_duration_ms, discovery_cache_hit) = target_cache
         .get(
             controller.kube_client(),
@@ -193,6 +237,13 @@ async fn scrape_once(
             controller.config().scrape_discovery_refresh_interval,
         )
         .await?;
+    let internal = internal_target::targets(controller.config(), controller.kube_client()).await;
+    let (targets, unavailable_internal_sources) = internal_target::combine(targets, internal);
+    crate::scrape_metrics::registry().counter(
+        "metrics_agent_internal_discovery_failures_total",
+        &[],
+        unavailable_internal_sources as u64,
+    );
     let limits = ScrapeLimits {
         max_response_bytes: controller.config().scrape_max_response_bytes,
         max_retained_bytes: controller.config().scrape_max_retained_bytes,
@@ -203,45 +254,20 @@ async fn scrape_once(
         max_metric_name_bytes: controller.config().scrape_max_metric_name_bytes,
         max_line_bytes: controller.config().scrape_max_line_bytes,
     };
-    let total = targets.len();
-    sender
-        .send(ScrapeMessage::Start { targets: total })
+    let target_count = targets.len();
+    let total = target_count.saturating_add(unavailable_internal_sources);
+    crate::queue_metrics::publish(sender, ScrapeMessage::Start { targets: total })
         .await
         .context("metrics remote-write channel closed")?;
-    let mut results = stream::iter((0..total).map(|index| {
+    let mut results = stream::iter((0..target_count).map(|index| {
         let targets = Arc::clone(&targets);
         async move {
             let target = &targets[index];
-            let identity = &target.identity;
-            if !namespace_allowed(
-                &identity.namespace,
-                &controller.config().scrape_allowed_namespaces,
-            ) {
-                bail!("scrape source namespace is not allowed");
-            }
-            let url = validate_scrape_url(
-                &target.url,
-                &controller.config().scrape_allowed_destinations,
-            )?;
-            let response = http
-                .get(url)
-                .send()
-                .await
-                .map_err(|_| anyhow::anyhow!("scrape request failed"))?;
-            if response.status().is_redirection() {
-                bail!("scrape redirects are disabled");
-            }
-            if !response.status().is_success() {
-                bail!("scrape returned HTTP {}", response.status());
-            }
-            let metrics = parse_bounded_response(
-                response,
-                &target.labels,
-                chrono::Utc::now().timestamp_millis(),
-                limits,
-            )
-            .await?;
-            Ok::<_, anyhow::Error>((index, metrics))
+            let mut attempt =
+                crate::scrape_metrics::Attempt::new(&target.identity.pair, &target.identity.source);
+            let result = fetch_target(http, target, controller.config(), limits).await;
+            attempt.finish(&result);
+            result.map(|metrics| (index, metrics))
         }
     }))
     .buffer_unordered(controller.config().scrape_concurrency);
@@ -273,18 +299,25 @@ async fn scrape_once(
                     .await;
                 samples += send_metric_chunks(sender, metrics).await?;
             }
-            Err(error) => debug!(reason = target_error_key(&error), "scrape target failed"),
+            Err(error) => debug!(
+                reason = error
+                    .downcast_ref::<crate::scrape_metrics::Failure>()
+                    .map_or("parse_error", |failure| failure.0.label()),
+                "scrape target failed"
+            ),
         }
     }
-    sender
-        .send(ScrapeMessage::Complete {
+    crate::queue_metrics::publish(
+        sender,
+        ScrapeMessage::Complete {
             targets: total,
             healthy_targets: healthy,
             samples,
             error: None,
-        })
-        .await
-        .context("metrics remote-write channel closed")?;
+        },
+    )
+    .await
+    .context("metrics remote-write channel closed")?;
     Ok((
         total,
         healthy,
@@ -294,19 +327,58 @@ async fn scrape_once(
     ))
 }
 
-fn target_error_key(error: &anyhow::Error) -> &'static str {
-    let message = error.to_string();
-    if message.contains("namespace") {
-        "namespace_denied"
-    } else if message.contains("destination") || message.contains("URL") {
-        "destination_denied"
-    } else if message.contains("redirect") {
-        "redirect_denied"
-    } else if message.contains("too large") || message.contains("limit") {
-        "resource_limit"
-    } else {
-        "request_failed"
+async fn fetch_target(
+    http: &reqwest::Client,
+    target: &ScrapeTarget,
+    config: &crate::config::Config,
+    limits: ScrapeLimits,
+) -> Result<Vec<CollectedMetric>> {
+    use crate::scrape_metrics::{Failure, Outcome, ResourceLimit};
+    if !internal_target::is_internal(target)
+        && !namespace_allowed(
+            &target.identity.namespace,
+            &config.scrape_allowed_namespaces,
+        )
+    {
+        return Err(Failure(Outcome::PolicyDenied).into());
     }
+    let url = validate_scrape_url(&target.url, &config.scrape_allowed_destinations)
+        .context(Failure(Outcome::PolicyDenied))?;
+    let request = internal_target::request(http, target, url, config)
+        .await
+        .context(Failure(Outcome::ConfigError))?;
+    let response = request.send().await.map_err(|error| {
+        let outcome = if error.is_timeout() {
+            Outcome::Timeout
+        } else {
+            Outcome::TransportError
+        };
+        anyhow::Error::new(error).context(Failure(outcome))
+    })?;
+    if !response.status().is_success() {
+        return Err(Failure(Outcome::HttpError).into());
+    }
+    parse_bounded_response(
+        response,
+        &target.labels,
+        chrono::Utc::now().timestamp_millis(),
+        limits,
+    )
+    .await
+    .map_err(|error| {
+        let outcome = if error.downcast_ref::<ResourceLimit>().is_some() {
+            Outcome::ResourceLimit
+        } else if let Some(error) = error.downcast_ref::<reqwest::Error>() {
+            if error.is_timeout() {
+                Outcome::Timeout
+            } else {
+                Outcome::TransportError
+            }
+        } else {
+            Outcome::ParseError
+        };
+        error.context(Failure(outcome))
+    })
 }
 
 fn namespace_allowed(namespace: &str, allowed: &[String]) -> bool {
@@ -468,7 +540,10 @@ async fn parse_bounded_response(
         .content_length()
         .is_some_and(|length| length > limits.max_response_bytes as u64)
     {
-        bail!("scrape response exceeds the configured byte limit");
+        return Err(crate::scrape_metrics::ResourceLimit(
+            "scrape response exceeds the configured byte limit",
+        )
+        .into());
     }
     let mut parser = BoundedTextParser::new(target_labels, default_timestamp, limits)?;
     let mut chunks = response.bytes_stream();
@@ -529,7 +604,10 @@ impl BoundedTextParser {
             self.pending.drain(..consumed);
         }
         if self.pending.len() > self.limits.max_line_bytes {
-            bail!("Prometheus exposition line exceeds the configured byte limit");
+            return Err(crate::scrape_metrics::ResourceLimit(
+                "Prometheus exposition line exceeds the configured byte limit",
+            )
+            .into());
         }
         Ok(())
     }
@@ -546,7 +624,10 @@ impl BoundedTextParser {
 
 fn account_response_bytes(total: &mut usize, chunk_bytes: usize, max_bytes: usize) -> Result<()> {
     if chunk_bytes > max_bytes.saturating_sub(*total) {
-        bail!("scrape response exceeds the configured byte limit");
+        return Err(crate::scrape_metrics::ResourceLimit(
+            "scrape response exceeds the configured byte limit",
+        )
+        .into());
     }
     *total += chunk_bytes;
     Ok(())
@@ -561,18 +642,16 @@ async fn send_metric_chunks(
     for metric in metrics {
         chunk.push(metric);
         if chunk.len() == 10_000 {
-            sender
-                .send(ScrapeMessage::Batch(std::mem::replace(
-                    &mut chunk,
-                    Vec::with_capacity(10_000),
-                )))
-                .await
-                .context("metrics remote-write channel closed")?;
+            crate::queue_metrics::publish(
+                sender,
+                ScrapeMessage::Batch(std::mem::replace(&mut chunk, Vec::with_capacity(10_000))),
+            )
+            .await
+            .context("metrics remote-write channel closed")?;
         }
     }
     if !chunk.is_empty() {
-        sender
-            .send(ScrapeMessage::Batch(chunk))
+        crate::queue_metrics::publish(sender, ScrapeMessage::Batch(chunk))
             .await
             .context("metrics remote-write channel closed")?;
     }
@@ -584,11 +663,7 @@ async fn discover_targets(client: Client, pairs: &[ResourcePair]) -> Result<Vec<
     let mut targets = Vec::new();
     for pair in pairs {
         let vm_api = Api::<DynamicObject>::all_with(client.clone(), &pair.victoria);
-        let vm_objects = vm_api
-            .list(&ListParams::default())
-            .await
-            .map(|list| list.items)
-            .unwrap_or_default();
+        let vm_objects = list_discovery_objects(&vm_api, pair.name, "victoria", false).await?;
         let mut selected = Vec::new();
         let mut keys = HashSet::new();
         for object in vm_objects {
@@ -596,11 +671,9 @@ async fn discover_targets(client: Client, pairs: &[ResourcePair]) -> Result<Vec<
             selected.push((object, "victoria"));
         }
         let prom_api = Api::<DynamicObject>::all_with(client.clone(), &pair.prometheus);
-        if let Ok(list) = prom_api.list(&ListParams::default()).await {
-            for object in list.items {
-                if keys.insert(object_key(&object)) {
-                    selected.push((object, "prometheus"));
-                }
+        for object in list_discovery_objects(&prom_api, pair.name, "prometheus", true).await? {
+            if keys.insert(object_key(&object)) {
+                selected.push((object, "prometheus"));
             }
         }
         for (object, source) in selected {
@@ -608,6 +681,35 @@ async fn discover_targets(client: Client, pairs: &[ResourcePair]) -> Result<Vec<
         }
     }
     Ok(deduplicate_targets(targets))
+}
+
+// Only a missing optional Prometheus CRD means an empty source. Other errors
+// invalidate the whole refresh so the bounded previous discovery remains intact.
+async fn list_discovery_objects(
+    api: &Api<DynamicObject>,
+    pair: &'static str,
+    source: &'static str,
+    optional: bool,
+) -> Result<Vec<DynamicObject>> {
+    match api.list(&ListParams::default()).await {
+        Ok(list) => {
+            crate::discovery_metrics::request(pair, source, "success");
+            Ok(list.items)
+        }
+        Err(kube::Error::Api(error)) if optional && error.code == 404 => {
+            crate::discovery_metrics::request(pair, source, "not_installed");
+            Ok(Vec::new())
+        }
+        Err(error) => {
+            let outcome = match &error {
+                kube::Error::Api(response) if matches!(response.code, 401 | 403) => "forbidden",
+                kube::Error::Api(response) if matches!(response.code, 408 | 504) => "timeout",
+                _ => "api_error",
+            };
+            crate::discovery_metrics::request(pair, source, outcome);
+            Err(error).context("refresh scrape CRD discovery")
+        }
+    }
 }
 
 async fn load_discovery_data(client: &Client) -> Result<DiscoveryData> {
@@ -1587,5 +1689,164 @@ mod tests {
 
         store.begin_scrape().await;
         assert!(store.snapshot().await.crd_metric_cardinality.is_empty());
+    }
+    #[tokio::test]
+    async fn failed_crd_refresh_preserves_previous_targets_until_stale_deadline() {
+        use axum::{
+            Json, Router,
+            http::{StatusCode, Uri},
+            response::IntoResponse,
+        };
+        use std::{
+            sync::{
+                Arc,
+                atomic::{AtomicU16, Ordering},
+            },
+            time::{Duration, Instant},
+        };
+        let response_code = Arc::new(AtomicU16::new(403));
+        let response = response_code.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().fallback(move |uri: Uri| { let response = response.clone(); async move {
+                if uri.path().contains("operator.victoriametrics.com") {
+                    (StatusCode::from_u16(response.load(Ordering::SeqCst)).unwrap(), Json(json!({"apiVersion":"v1","kind":"Status","status":"Failure","message":"list failed","reason":"Forbidden","code":response.load(Ordering::SeqCst)}))).into_response()
+                } else { Json(json!({"apiVersion":"v1","kind":"List","metadata":{},"items":[]})).into_response() }
+            }})).await.unwrap();
+        });
+        let client = kube::Client::try_from(kube::Config::new(endpoint.parse().unwrap())).unwrap();
+        let mut cache = super::TargetCache {
+            refreshed_at: Some(Instant::now() - Duration::from_secs(15)),
+            targets: vec![ScrapeTarget {
+                url: "http://old:80/metrics".into(),
+                labels: vec![],
+                identity: identity("service-monitor", "victoria"),
+            }]
+            .into(),
+        };
+        let pairs = crate::controller::resource_pairs();
+        let (retained, _, stale) = cache
+            .get(client.clone(), &pairs, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(stale);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].url, "http://old:80/metrics");
+        cache.refreshed_at = Some(Instant::now() - Duration::from_secs(21));
+        assert!(
+            cache
+                .get(client, &pairs, Duration::from_secs(10))
+                .await
+                .is_err()
+        );
+        assert_eq!(cache.targets.len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn only_optional_missing_crd_is_a_successful_empty_source() {
+        use axum::{Json, Router, http::StatusCode};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().fallback(|| async { (StatusCode::NOT_FOUND, Json(json!({"apiVersion":"v1","kind":"Status","status":"Failure","message":"missing","reason":"NotFound","code":404}))) })).await.unwrap();
+        });
+        let client = kube::Client::try_from(kube::Config::new(endpoint.parse().unwrap())).unwrap();
+        let pair = crate::controller::resource_pairs().remove(0);
+        let api = kube::Api::all_with(client, &pair.prometheus);
+        assert!(
+            super::list_discovery_objects(&api, pair.name, "prometheus", true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            super::list_discovery_objects(&api, pair.name, "victoria", false)
+                .await
+                .is_err()
+        );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn scrape_failures_are_typed_and_internal_source_is_bounded() {
+        use axum::{
+            Router,
+            http::{StatusCode, Uri},
+        };
+        use clap::Parser;
+        use std::time::Duration;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(|uri: Uri| async move {
+                    match uri.path() {
+                        "/http" => (StatusCode::FORBIDDEN, "denied"),
+                        "/limit" => (StatusCode::OK, "large_response 100"),
+                        "/parse" => (StatusCode::OK, "m{a=bad} 1"),
+                        "/timeout" => {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            (StatusCode::OK, "m 1")
+                        }
+                        _ => (StatusCode::OK, "m 1"),
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        });
+        let mut config = crate::config::Config::parse_from(["test"]);
+        config.scrape_allowed_destinations = vec!["127.0.0.1".into()];
+        let http =
+            super::scrape_client(Duration::from_millis(30), vec!["127.0.0.1".into()]).unwrap();
+        for (path, expected, max_bytes) in [
+            ("/http", "http_error", 100),
+            ("/limit", "resource_limit", 3),
+            ("/parse", "parse_error", 100),
+            ("/timeout", "timeout", 100),
+        ] {
+            let target = ScrapeTarget {
+                url: format!("{endpoint}{path}"),
+                labels: vec![],
+                identity: identity("service-monitor", "prometheus"),
+            };
+            let mut attempt =
+                crate::scrape_metrics::Attempt::new(&target.identity.pair, &target.identity.source);
+            let result = super::fetch_target(
+                &http,
+                &target,
+                &config,
+                ScrapeLimits {
+                    max_response_bytes: max_bytes,
+                    ..Default::default()
+                },
+            )
+            .await;
+            assert_eq!(
+                result
+                    .as_ref()
+                    .unwrap_err()
+                    .downcast_ref::<crate::scrape_metrics::Failure>()
+                    .unwrap()
+                    .0
+                    .label(),
+                expected
+            );
+            attempt.finish(&result);
+        }
+        drop(crate::scrape_metrics::Attempt::new("internal", "internal"));
+        drop(crate::scrape_metrics::Attempt::new(
+            "arbitrary-name",
+            "arbitrary-source",
+        ));
+        let metrics = crate::scrape_metrics::registry().render();
+        assert!(
+            metrics
+                .contains("resource_pair=\"internal\",source=\"internal\",outcome=\"cancelled\"")
+        );
+        assert!(!metrics.contains("arbitrary-name"));
+        server.abort();
     }
 }

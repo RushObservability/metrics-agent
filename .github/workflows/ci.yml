@@ -39,6 +39,9 @@ jobs:
       - name: Render Helm chart
         run: helm template metrics-agent helm-chart --namespace monitoring --set rushRemoteWrite.enabled=true --set rushRemoteWrite.allowAnonymous=true --set 'rushRemoteWrite.url=http://localhost:8080/prom/api/v1/write' >/dev/null
 
+      - name: Validate authenticated SRE scrape configuration
+        run: bash helm-chart/tests/sre-metrics-render.sh
+
       - name: Validate workflow YAML
         run: |
           ruby -e 'require "yaml"; Dir[".github/workflows/*.yml"].each { |path| YAML.load_file(path); puts "valid YAML: #{path}" }'

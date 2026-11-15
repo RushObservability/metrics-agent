@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "sreMetrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled", "url", "tokenSecret"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "discovery": {
+          "type": "object", "additionalProperties": false,
+          "required": ["enabled", "serviceName", "namespace"],
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "serviceName": { "type": "string", "maxLength": 63, "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" },
+            "namespace": { "type": "string", "maxLength": 63, "pattern": "^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" }
+          }
+        },
+        "url": { "type": "string", "pattern": "^$|^https?://[^/?#@]+/metrics$" },
+        "tokenSecret": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "key"],
+          "properties": {
+            "name": { "type": "string", "maxLength": 253, "pattern": "^$|^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" },
+            "key": { "type": "string", "minLength": 1, "maxLength": 253, "pattern": "^[A-Za-z0-9_.-]+$" }
+          }
+        }
+      }
+    }
+  }
+}

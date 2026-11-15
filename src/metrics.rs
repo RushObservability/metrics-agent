@@ -1,3 +1,5 @@
+pub(crate) mod instruments;
+
 use crate::status::StatusSnapshot;
 
 pub fn render(snapshot: &StatusSnapshot) -> String {
@@ -194,6 +196,11 @@ pub fn render(snapshot: &StatusSnapshot) -> String {
             duration_ms,
         );
     }
+    output.push_str(&crate::delivery_metrics::global().0.render());
+    output.push_str(&crate::discovery_metrics::registry().render());
+    output.push_str(&crate::worker_metrics::registry().render());
+    output.push_str(&crate::scrape_metrics::registry().render());
+    output.push_str(&crate::queue_metrics::registry().render());
     output
 }
 

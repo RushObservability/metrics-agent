@@ -160,6 +160,10 @@ impl Controller {
         config: Config,
         scrape_sender: tokio::sync::mpsc::Sender<ScrapeMessage>,
     ) -> Arc<Self> {
+        crate::queue_metrics::initialize(
+            crate::queue_metrics::Queue::Publish,
+            scrape_sender.max_capacity(),
+        );
         let pairs = resource_pairs();
         let status = StatusStore::new(
             config.agent_version.clone(),
@@ -199,11 +203,15 @@ impl Controller {
         let names = self.pairs.iter().map(|pair| pair.name).collect::<Vec<_>>();
         self.status.initialize_pairs(&names).await;
         let (queue_tx, queue_rx) = mpsc::channel::<ReconcileKey>(4096);
+        crate::queue_metrics::initialize(
+            crate::queue_metrics::Queue::Reconcile,
+            queue_tx.max_capacity(),
+        );
         let mut tasks = Vec::new();
 
         for (pair_index, pair) in self.pairs.iter().enumerate() {
             let vm_api = Api::<DynamicObject>::all_with(self.client.clone(), &pair.victoria);
-            let vm_objects = list_objects(&vm_api)
+            let vm_objects = list_objects(&vm_api, pair.name, "victoria")
                 .await
                 .with_context(|| format!("list required {} CRD", pair.name))?;
             self.status
@@ -226,7 +234,7 @@ impl Controller {
             );
 
             let prom_api = Api::<DynamicObject>::all_with(self.client.clone(), &pair.prometheus);
-            match list_objects(&prom_api).await {
+            match list_objects(&prom_api, pair.name, "prometheus").await {
                 Ok(prom_objects) => {
                     self.status
                         .set_source_available(pair_index, true, true)
@@ -274,11 +282,15 @@ impl Controller {
         );
 
         if self.config.scrape_enabled {
-            tasks.push(tokio::spawn(crate::scraper::run(
-                Arc::clone(&self),
-                self.scrape_sender.clone(),
+            tasks.push(crate::worker_metrics::spawn(
+                crate::worker_metrics::Worker::Scraper,
                 shutdown.clone(),
-            )));
+                crate::scraper::run(
+                    Arc::clone(&self),
+                    self.scrape_sender.clone(),
+                    shutdown.clone(),
+                ),
+            ));
         }
 
         let queue_rx = Arc::new(tokio::sync::Mutex::new(queue_rx));
@@ -286,12 +298,10 @@ impl Controller {
             tasks.push(self.spawn_worker(queue_rx.clone(), shutdown.clone()));
         }
         tasks.push(self.spawn_resync(queue_tx.clone(), shutdown.clone()));
-        shutdown.cancelled().await;
+        let result = crate::worker_metrics::supervise(&mut tasks, &shutdown).await;
         self.status.set_ready(false).await;
-        for task in tasks {
-            task.abort();
-        }
-        Ok(())
+        crate::queue_metrics::closed(crate::queue_metrics::Queue::Reconcile);
+        result
     }
 
     fn spawn_watcher(
@@ -306,7 +316,7 @@ impl Controller {
         let status = self.status.clone();
         let pair_name = self.pairs[pair_index].name;
         let pair_kind = self.pairs[pair_index].prometheus_kind;
-        tasks.push(tokio::spawn(async move {
+        tasks.push(crate::worker_metrics::spawn(crate::worker_metrics::Worker::Watcher, shutdown.clone(), async move {
             loop {
                 let stream = watcher::watcher(api.clone(), watcher::Config::default());
                 tokio::pin!(stream);
@@ -314,6 +324,8 @@ impl Controller {
                     _ = shutdown.cancelled() => return,
                     event = stream.next() => event,
                 } {
+                    let source = if prometheus { "prometheus" } else { "victoria" };
+                    crate::queue_metrics::operation("watch", pair_name, source, if event.is_ok() { "success" } else { "error" });
                     match event {
                         Ok(Event::Apply(object) | Event::InitApply(object)) => {
                             let key = object_key(&object);
@@ -360,26 +372,30 @@ impl Controller {
         shutdown: CancellationToken,
     ) -> JoinHandle<()> {
         let controller = Arc::clone(self);
-        tokio::spawn(async move {
-            loop {
-                let key = {
-                    let mut receiver = queue.lock().await;
-                    tokio::select! {
-                        _ = shutdown.cancelled() => return,
-                        key = receiver.recv() => key,
+        crate::worker_metrics::spawn(
+            crate::worker_metrics::Worker::Reconciler,
+            shutdown.clone(),
+            async move {
+                loop {
+                    let key = {
+                        let mut receiver = queue.lock().await;
+                        tokio::select! {
+                            _ = shutdown.cancelled() => return,
+                            key = crate::queue_metrics::recv(&mut receiver, crate::queue_metrics::Queue::Reconcile) => key,
+                        }
+                    };
+                    let Some(key) = key else { return };
+                    if let Err(error) = controller.reconcile(key.clone()).await {
+                        controller
+                            .status
+                            .counters
+                            .errors
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        warn!(pair = controller.pairs[key.pair].name, namespace = key.namespace, name = key.name, error = %error, "precedence reconciliation failed");
                     }
-                };
-                let Some(key) = key else { return };
-                if let Err(error) = controller.reconcile(key.clone()).await {
-                    controller
-                        .status
-                        .counters
-                        .errors
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    warn!(pair = controller.pairs[key.pair].name, namespace = key.namespace, name = key.name, error = %error, "precedence reconciliation failed");
                 }
-            }
-        })
+            },
+        )
     }
 
     fn spawn_resync(
@@ -388,32 +404,47 @@ impl Controller {
         shutdown: CancellationToken,
     ) -> JoinHandle<()> {
         let controller = Arc::clone(self);
-        tokio::spawn(async move {
-            let mut interval = time::interval(controller.config.resync_period);
-            loop {
-                tokio::select! {
-                    _ = shutdown.cancelled() => return,
-                    _ = interval.tick() => {
-                        for (pair_index, pair) in controller.pairs.iter().enumerate() {
-                            let vm_api = Api::<DynamicObject>::all_with(controller.client.clone(), &pair.victoria);
-                            match list_objects(&vm_api).await {
-                                Ok(objects) => {
-                                    controller.status.replace_objects(pair_index, false, object_entries(&objects, pair.prometheus_kind)).await;
-                                    for object in objects { send_key(&queue, pair_index, &object).await; }
-                                }
-                                Err(error) => {
-                                    controller.status.counters.errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    debug!(resource_pair = pair.name, error = %error, "resync list failed");
+        crate::worker_metrics::spawn(
+            crate::worker_metrics::Worker::Resync,
+            shutdown.clone(),
+            async move {
+                let mut interval = time::interval(controller.config.resync_period);
+                loop {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        _ = interval.tick() => {
+                            for (pair_index, pair) in controller.pairs.iter().enumerate() {
+                                let vm_api = Api::<DynamicObject>::all_with(controller.client.clone(), &pair.victoria);
+                                match list_objects(&vm_api, pair.name, "victoria").await {
+                                    Ok(objects) => {
+                                        controller.status.replace_objects(pair_index, false, object_entries(&objects, pair.prometheus_kind)).await;
+                                        for object in objects { send_key(&queue, pair_index, &object).await; }
+                                    }
+                                    Err(error) => {
+                                        controller.status.counters.errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        debug!(resource_pair = pair.name, error = %error, "resync list failed");
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
-        })
+            },
+        )
     }
 
     async fn reconcile(&self, key: ReconcileKey) -> Result<()> {
+        let mut operation = crate::queue_metrics::Operation::new(
+            "reconcile",
+            self.pairs[key.pair].name,
+            "victoria",
+        );
+        let result = self.reconcile_inner(key).await;
+        operation.finish(if result.is_ok() { "success" } else { "error" });
+        result
+    }
+
+    async fn reconcile_inner(&self, key: ReconcileKey) -> Result<()> {
         use std::sync::atomic::Ordering;
         self.status
             .counters
@@ -425,7 +456,14 @@ impl Controller {
             &key.namespace,
             &pair.victoria,
         );
-        let Some(vm_object) = vm_api.get_opt(&key.name).await? else {
+        let Some(vm_object) = crate::queue_metrics::kube_operation(
+            "get",
+            pair.name,
+            "victoria",
+            vm_api.get_opt(&key.name),
+        )
+        .await?
+        else {
             return Ok(());
         };
         let prom_exists =
@@ -435,7 +473,14 @@ impl Controller {
                     &key.namespace,
                     &pair.prometheus,
                 );
-                prom_api.get_opt(&key.name).await?.is_some()
+                crate::queue_metrics::kube_operation(
+                    "get",
+                    pair.name,
+                    "prometheus",
+                    prom_api.get_opt(&key.name),
+                )
+                .await?
+                .is_some()
             } else {
                 false
             };
@@ -454,13 +499,17 @@ impl Controller {
         ) else {
             return Ok(());
         };
-        vm_api
-            .patch(
+        crate::queue_metrics::kube_operation(
+            "patch",
+            pair.name,
+            "victoria",
+            vm_api.patch(
                 &key.name,
                 &PatchParams::default(),
                 &Patch::Merge(plan.patch),
-            )
-            .await?;
+            ),
+        )
+        .await?;
         if plan.decision.ignore_prometheus_updates {
             self.status
                 .counters
@@ -488,8 +537,14 @@ impl Controller {
     }
 }
 
-async fn list_objects(api: &Api<DynamicObject>) -> Result<Vec<DynamicObject>, kube::Error> {
-    Ok(api.list(&ListParams::default()).await?.items)
+async fn list_objects(
+    api: &Api<DynamicObject>,
+    pair: &'static str,
+    source: &'static str,
+) -> Result<Vec<DynamicObject>, kube::Error> {
+    crate::queue_metrics::kube_operation("list", pair, source, api.list(&ListParams::default()))
+        .await
+        .map(|objects| objects.items)
 }
 
 fn is_not_found(error: &kube::Error) -> bool {
@@ -544,7 +599,10 @@ async fn send_key(queue: &mpsc::Sender<ReconcileKey>, pair: usize, object: &Dyna
         namespace,
         name: object.name_any(),
     };
-    if queue.send(key).await.is_err() {
+    if crate::queue_metrics::send(queue, key, crate::queue_metrics::Queue::Reconcile)
+        .await
+        .is_err()
+    {
         debug!("reconciliation queue closed");
     }
 }

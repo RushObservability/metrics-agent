@@ -118,6 +118,21 @@ pub struct Config {
     #[arg(long, env = "METRICS_AGENT_SCRAPE_ENABLED", default_value_t = true)]
     pub scrape_enabled: bool,
 
+    /// Explicit operator-managed SRE-agent endpoint, separate from CRD targets.
+    #[arg(long, env = "METRICS_AGENT_SRE_METRICS_URL", hide_env_values = true)]
+    pub sre_metrics_url: Option<String>,
+
+    /// Projected Secret file, read for each scrape to support token rotation.
+    #[arg(long, env = "METRICS_AGENT_SRE_METRICS_TOKEN_FILE")]
+    pub sre_metrics_token_file: Option<PathBuf>,
+
+    /// Trusted Kubernetes Service whose ready endpoints are scraped individually.
+    #[arg(long, env = "METRICS_AGENT_SRE_METRICS_SERVICE")]
+    pub sre_metrics_service: Option<String>,
+
+    #[arg(long, env = "METRICS_AGENT_SRE_METRICS_NAMESPACE")]
+    pub sre_metrics_namespace: Option<String>,
+
     #[arg(
         long,
         env = "METRICS_AGENT_SCRAPE_INTERVAL",

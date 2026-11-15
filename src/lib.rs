@@ -8,3 +8,13 @@ pub mod scraper;
 pub mod status;
 
 pub const DEFAULT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub(crate) mod delivery_metrics;
+
+pub(crate) mod discovery_metrics;
+
+pub mod worker_metrics;
+
+pub(crate) mod scrape_metrics;
+
+pub(crate) mod queue_metrics;

@@ -82,6 +82,24 @@ spec:
               value: {{ .Values.ui.path | quote }}
             - name: METRICS_AGENT_EXTRA_LABELS
               value: {{ .Values.extraLabels | toJson | quote }}
+            {{- if and .Values.sreMetrics.enabled .Values.scrape.enabled }}
+            - name: METRICS_AGENT_SRE_METRICS_URL
+              value: {{ required "sreMetrics.url is required" .Values.sreMetrics.url | quote }}
+            - name: METRICS_AGENT_SRE_METRICS_TOKEN_FILE
+              value: /var/run/rush-sre-metrics/token
+            {{- if .Values.sreMetrics.discovery.enabled }}
+            - name: METRICS_AGENT_SRE_METRICS_SERVICE
+              value: {{ required "sreMetrics.discovery.serviceName is required" .Values.sreMetrics.discovery.serviceName | quote }}
+            - name: METRICS_AGENT_SRE_METRICS_NAMESPACE
+              {{- if .Values.sreMetrics.discovery.namespace }}
+              value: {{ .Values.sreMetrics.discovery.namespace | quote }}
+              {{- else }}
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+              {{- end }}
+            {{- end }}
+            {{- end }}
             {{- if .Values.rushRemoteWrite.enabled }}
             {{- if and (not .Values.rushRemoteWrite.bearerTokenSecret.name) (not .Values.rushRemoteWrite.allowAnonymous) }}
             {{- fail "rushRemoteWrite.bearerTokenSecret.name is required when Rush remote write is enabled" }}
@@ -134,6 +152,22 @@ spec:
             {{- toYaml .Values.securityContext | nindent 12 }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+          {{- if and .Values.sreMetrics.enabled .Values.scrape.enabled }}
+          volumeMounts:
+            - name: sre-metrics-token
+              mountPath: /var/run/rush-sre-metrics
+              readOnly: true
+          {{- end }}
+      {{- if and .Values.sreMetrics.enabled .Values.scrape.enabled }}
+      volumes:
+        - name: sre-metrics-token
+          secret:
+            secretName: {{ required "sreMetrics.tokenSecret.name is required" .Values.sreMetrics.tokenSecret.name | quote }}
+            defaultMode: 0440
+            items:
+              - key: {{ .Values.sreMetrics.tokenSecret.key | quote }}
+                path: token
+      {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
