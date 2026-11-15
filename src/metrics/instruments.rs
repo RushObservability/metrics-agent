@@ -38,6 +38,20 @@ impl Registry {
             .unwrap_or_else(|e| e.into_inner())
             .insert((name, labels.to_vec()), Value::Gauge(value));
     }
+    pub fn add_gauge(
+        &self,
+        name: &'static str,
+        labels: &[(&'static str, &'static str)],
+        amount: f64,
+    ) {
+        let mut values = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Value::Gauge(value) = values
+            .entry((name, labels.to_vec()))
+            .or_insert(Value::Gauge(0.0))
+        {
+            *value += amount;
+        }
+    }
     pub fn observe(&self, name: &'static str, labels: &[(&'static str, &'static str)], value: f64) {
         let mut values = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if let Value::Histogram {

@@ -274,11 +274,15 @@ impl Controller {
         );
 
         if self.config.scrape_enabled {
-            tasks.push(tokio::spawn(crate::scraper::run(
-                Arc::clone(&self),
-                self.scrape_sender.clone(),
+            tasks.push(crate::worker_metrics::spawn(
+                crate::worker_metrics::Worker::Scraper,
                 shutdown.clone(),
-            )));
+                crate::scraper::run(
+                    Arc::clone(&self),
+                    self.scrape_sender.clone(),
+                    shutdown.clone(),
+                ),
+            ));
         }
 
         let queue_rx = Arc::new(tokio::sync::Mutex::new(queue_rx));
@@ -286,12 +290,9 @@ impl Controller {
             tasks.push(self.spawn_worker(queue_rx.clone(), shutdown.clone()));
         }
         tasks.push(self.spawn_resync(queue_tx.clone(), shutdown.clone()));
-        shutdown.cancelled().await;
+        let result = crate::worker_metrics::supervise(&mut tasks, &shutdown).await;
         self.status.set_ready(false).await;
-        for task in tasks {
-            task.abort();
-        }
-        Ok(())
+        result
     }
 
     fn spawn_watcher(
@@ -306,7 +307,7 @@ impl Controller {
         let status = self.status.clone();
         let pair_name = self.pairs[pair_index].name;
         let pair_kind = self.pairs[pair_index].prometheus_kind;
-        tasks.push(tokio::spawn(async move {
+        tasks.push(crate::worker_metrics::spawn(crate::worker_metrics::Worker::Watcher, shutdown.clone(), async move {
             loop {
                 let stream = watcher::watcher(api.clone(), watcher::Config::default());
                 tokio::pin!(stream);
@@ -360,26 +361,30 @@ impl Controller {
         shutdown: CancellationToken,
     ) -> JoinHandle<()> {
         let controller = Arc::clone(self);
-        tokio::spawn(async move {
-            loop {
-                let key = {
-                    let mut receiver = queue.lock().await;
-                    tokio::select! {
-                        _ = shutdown.cancelled() => return,
-                        key = receiver.recv() => key,
+        crate::worker_metrics::spawn(
+            crate::worker_metrics::Worker::Reconciler,
+            shutdown.clone(),
+            async move {
+                loop {
+                    let key = {
+                        let mut receiver = queue.lock().await;
+                        tokio::select! {
+                            _ = shutdown.cancelled() => return,
+                            key = receiver.recv() => key,
+                        }
+                    };
+                    let Some(key) = key else { return };
+                    if let Err(error) = controller.reconcile(key.clone()).await {
+                        controller
+                            .status
+                            .counters
+                            .errors
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        warn!(pair = controller.pairs[key.pair].name, namespace = key.namespace, name = key.name, error = %error, "precedence reconciliation failed");
                     }
-                };
-                let Some(key) = key else { return };
-                if let Err(error) = controller.reconcile(key.clone()).await {
-                    controller
-                        .status
-                        .counters
-                        .errors
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    warn!(pair = controller.pairs[key.pair].name, namespace = key.namespace, name = key.name, error = %error, "precedence reconciliation failed");
                 }
-            }
-        })
+            },
+        )
     }
 
     fn spawn_resync(
@@ -388,29 +393,33 @@ impl Controller {
         shutdown: CancellationToken,
     ) -> JoinHandle<()> {
         let controller = Arc::clone(self);
-        tokio::spawn(async move {
-            let mut interval = time::interval(controller.config.resync_period);
-            loop {
-                tokio::select! {
-                    _ = shutdown.cancelled() => return,
-                    _ = interval.tick() => {
-                        for (pair_index, pair) in controller.pairs.iter().enumerate() {
-                            let vm_api = Api::<DynamicObject>::all_with(controller.client.clone(), &pair.victoria);
-                            match list_objects(&vm_api).await {
-                                Ok(objects) => {
-                                    controller.status.replace_objects(pair_index, false, object_entries(&objects, pair.prometheus_kind)).await;
-                                    for object in objects { send_key(&queue, pair_index, &object).await; }
-                                }
-                                Err(error) => {
-                                    controller.status.counters.errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    debug!(resource_pair = pair.name, error = %error, "resync list failed");
+        crate::worker_metrics::spawn(
+            crate::worker_metrics::Worker::Resync,
+            shutdown.clone(),
+            async move {
+                let mut interval = time::interval(controller.config.resync_period);
+                loop {
+                    tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        _ = interval.tick() => {
+                            for (pair_index, pair) in controller.pairs.iter().enumerate() {
+                                let vm_api = Api::<DynamicObject>::all_with(controller.client.clone(), &pair.victoria);
+                                match list_objects(&vm_api).await {
+                                    Ok(objects) => {
+                                        controller.status.replace_objects(pair_index, false, object_entries(&objects, pair.prometheus_kind)).await;
+                                        for object in objects { send_key(&queue, pair_index, &object).await; }
+                                    }
+                                    Err(error) => {
+                                        controller.status.counters.errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        debug!(resource_pair = pair.name, error = %error, "resync list failed");
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
-        })
+            },
+        )
     }
 
     async fn reconcile(&self, key: ReconcileKey) -> Result<()> {

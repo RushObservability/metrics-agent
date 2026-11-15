@@ -173,6 +173,7 @@ async fn publish_inner(
     scraped: Vec<CollectedMetric>,
     options: PublishOptions<'_>,
 ) -> Result<PublishResult> {
+    let workload = !scraped.is_empty();
     let mut attempt = options.delivery.attempt(scraped.len());
     let snapshot = snapshot.cloned();
     let extra_labels = options.extra_labels.clone();
@@ -226,6 +227,11 @@ async fn publish_inner(
     }
 
     attempt.finish("success");
+    crate::worker_metrics::success(if workload {
+        "workload_publish"
+    } else {
+        "self_publish"
+    });
     Ok(PublishResult {
         series: payload.series,
         samples: payload.samples,

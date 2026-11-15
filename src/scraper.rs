@@ -91,6 +91,7 @@ impl TargetCache {
         match discover_targets(client, pairs).await {
             Ok(targets) => {
                 crate::discovery_metrics::refresh("complete");
+                crate::worker_metrics::success("discovery");
                 crate::discovery_metrics::cache("refreshed", 0.0);
                 let duration_ms = started.elapsed().as_millis() as u64;
                 let targets: Arc<[ScrapeTarget]> = targets.into();
@@ -158,6 +159,7 @@ pub async fn run(
                 let timestamp = chrono::Utc::now().to_rfc3339();
                 match result {
                     Ok((targets, healthy, samples, discovery_duration_ms, discovery_cache_hit)) => {
+                        if healthy == targets { crate::worker_metrics::success("scrape"); }
                         controller.status.set_scrape_status(ScrapeStatus {
                             enabled: true,
                             targets: targets as u64,

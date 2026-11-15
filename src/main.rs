@@ -31,7 +31,7 @@ async fn main() -> Result<()> {
         let controller = Arc::clone(&controller);
         tokio::spawn(async move { controller.run(controller_shutdown).await })
     };
-    let remote_write_task = {
+    let mut remote_write_task = {
         let status = Arc::clone(&controller.status);
         let token = config.rush_remote_write_token.clone();
         let tenant = config.rush_remote_write_tenant.clone();
@@ -42,20 +42,24 @@ async fn main() -> Result<()> {
             config.rush_remote_write_timeout,
         )?;
         let shutdown = shutdown.clone();
-        tokio::spawn(remote_write::run(
-            client,
-            status,
-            scrape_receiver,
-            config
-                .rush_remote_write_url
-                .clone()
-                .filter(|url| !url.trim().is_empty()),
-            token,
-            tenant,
-            extra_labels,
-            interval,
-            shutdown,
-        ))
+        metrics_agent::worker_metrics::spawn(
+            metrics_agent::worker_metrics::Worker::RemoteWriter,
+            shutdown.clone(),
+            remote_write::run(
+                client,
+                status,
+                scrape_receiver,
+                config
+                    .rush_remote_write_url
+                    .clone()
+                    .filter(|url| !url.trim().is_empty()),
+                token,
+                tenant,
+                extra_labels,
+                interval,
+                shutdown,
+            ),
+        )
     };
 
     let address = config.http_socket_addr()?;
@@ -82,6 +86,7 @@ async fn main() -> Result<()> {
         .into_future();
     tokio::pin!(server);
 
+    let mut remote_writer_finished = false;
     tokio::select! {
         result = &mut server => {
             if let Err(error) = result { error!(%error, "HTTP server stopped unexpectedly"); }
@@ -95,6 +100,11 @@ async fn main() -> Result<()> {
             }
             shutdown.cancel();
         }
+        result = &mut remote_write_task => {
+            remote_writer_finished = true;
+            match result { Ok(()) => error!("remote writer stopped unexpectedly"), Err(error) => error!(%error, "remote writer task failed") }
+            shutdown.cancel();
+        }
         _ = tokio::signal::ctrl_c() => {
             info!("shutdown signal received");
             shutdown.cancel();
@@ -106,7 +116,9 @@ async fn main() -> Result<()> {
         ui_server.abort();
         let _ = ui_server.await;
     }
-    remote_write_task.abort();
-    let _ = remote_write_task.await;
+    if !remote_writer_finished {
+        remote_write_task.abort();
+        let _ = remote_write_task.await;
+    }
     Ok(())
 }
