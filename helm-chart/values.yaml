@@ -137,6 +137,10 @@ sreMetrics:
   tokenSecret:
     name: ""
     key: sre-agent-internal-token
+  discovery:
+    enabled: false
+    serviceName: ""
+    namespace: ""
 
 # Additional non-secret environment variables for the metrics-agent container.
 env: []
