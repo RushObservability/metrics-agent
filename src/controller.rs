@@ -160,6 +160,10 @@ impl Controller {
         config: Config,
         scrape_sender: tokio::sync::mpsc::Sender<ScrapeMessage>,
     ) -> Arc<Self> {
+        crate::queue_metrics::initialize(
+            crate::queue_metrics::Queue::Publish,
+            scrape_sender.max_capacity(),
+        );
         let pairs = resource_pairs();
         let status = StatusStore::new(
             config.agent_version.clone(),
@@ -199,11 +203,15 @@ impl Controller {
         let names = self.pairs.iter().map(|pair| pair.name).collect::<Vec<_>>();
         self.status.initialize_pairs(&names).await;
         let (queue_tx, queue_rx) = mpsc::channel::<ReconcileKey>(4096);
+        crate::queue_metrics::initialize(
+            crate::queue_metrics::Queue::Reconcile,
+            queue_tx.max_capacity(),
+        );
         let mut tasks = Vec::new();
 
         for (pair_index, pair) in self.pairs.iter().enumerate() {
             let vm_api = Api::<DynamicObject>::all_with(self.client.clone(), &pair.victoria);
-            let vm_objects = list_objects(&vm_api)
+            let vm_objects = list_objects(&vm_api, pair.name, "victoria")
                 .await
                 .with_context(|| format!("list required {} CRD", pair.name))?;
             self.status
@@ -226,7 +234,7 @@ impl Controller {
             );
 
             let prom_api = Api::<DynamicObject>::all_with(self.client.clone(), &pair.prometheus);
-            match list_objects(&prom_api).await {
+            match list_objects(&prom_api, pair.name, "prometheus").await {
                 Ok(prom_objects) => {
                     self.status
                         .set_source_available(pair_index, true, true)
@@ -292,6 +300,7 @@ impl Controller {
         tasks.push(self.spawn_resync(queue_tx.clone(), shutdown.clone()));
         let result = crate::worker_metrics::supervise(&mut tasks, &shutdown).await;
         self.status.set_ready(false).await;
+        crate::queue_metrics::closed(crate::queue_metrics::Queue::Reconcile);
         result
     }
 
@@ -315,6 +324,8 @@ impl Controller {
                     _ = shutdown.cancelled() => return,
                     event = stream.next() => event,
                 } {
+                    let source = if prometheus { "prometheus" } else { "victoria" };
+                    crate::queue_metrics::operation("watch", pair_name, source, if event.is_ok() { "success" } else { "error" });
                     match event {
                         Ok(Event::Apply(object) | Event::InitApply(object)) => {
                             let key = object_key(&object);
@@ -370,7 +381,7 @@ impl Controller {
                         let mut receiver = queue.lock().await;
                         tokio::select! {
                             _ = shutdown.cancelled() => return,
-                            key = receiver.recv() => key,
+                            key = crate::queue_metrics::recv(&mut receiver, crate::queue_metrics::Queue::Reconcile) => key,
                         }
                     };
                     let Some(key) = key else { return };
@@ -404,7 +415,7 @@ impl Controller {
                         _ = interval.tick() => {
                             for (pair_index, pair) in controller.pairs.iter().enumerate() {
                                 let vm_api = Api::<DynamicObject>::all_with(controller.client.clone(), &pair.victoria);
-                                match list_objects(&vm_api).await {
+                                match list_objects(&vm_api, pair.name, "victoria").await {
                                     Ok(objects) => {
                                         controller.status.replace_objects(pair_index, false, object_entries(&objects, pair.prometheus_kind)).await;
                                         for object in objects { send_key(&queue, pair_index, &object).await; }
@@ -423,6 +434,17 @@ impl Controller {
     }
 
     async fn reconcile(&self, key: ReconcileKey) -> Result<()> {
+        let mut operation = crate::queue_metrics::Operation::new(
+            "reconcile",
+            self.pairs[key.pair].name,
+            "victoria",
+        );
+        let result = self.reconcile_inner(key).await;
+        operation.finish(if result.is_ok() { "success" } else { "error" });
+        result
+    }
+
+    async fn reconcile_inner(&self, key: ReconcileKey) -> Result<()> {
         use std::sync::atomic::Ordering;
         self.status
             .counters
@@ -434,7 +456,14 @@ impl Controller {
             &key.namespace,
             &pair.victoria,
         );
-        let Some(vm_object) = vm_api.get_opt(&key.name).await? else {
+        let Some(vm_object) = crate::queue_metrics::kube_operation(
+            "get",
+            pair.name,
+            "victoria",
+            vm_api.get_opt(&key.name),
+        )
+        .await?
+        else {
             return Ok(());
         };
         let prom_exists =
@@ -444,7 +473,14 @@ impl Controller {
                     &key.namespace,
                     &pair.prometheus,
                 );
-                prom_api.get_opt(&key.name).await?.is_some()
+                crate::queue_metrics::kube_operation(
+                    "get",
+                    pair.name,
+                    "prometheus",
+                    prom_api.get_opt(&key.name),
+                )
+                .await?
+                .is_some()
             } else {
                 false
             };
@@ -463,13 +499,17 @@ impl Controller {
         ) else {
             return Ok(());
         };
-        vm_api
-            .patch(
+        crate::queue_metrics::kube_operation(
+            "patch",
+            pair.name,
+            "victoria",
+            vm_api.patch(
                 &key.name,
                 &PatchParams::default(),
                 &Patch::Merge(plan.patch),
-            )
-            .await?;
+            ),
+        )
+        .await?;
         if plan.decision.ignore_prometheus_updates {
             self.status
                 .counters
@@ -497,8 +537,14 @@ impl Controller {
     }
 }
 
-async fn list_objects(api: &Api<DynamicObject>) -> Result<Vec<DynamicObject>, kube::Error> {
-    Ok(api.list(&ListParams::default()).await?.items)
+async fn list_objects(
+    api: &Api<DynamicObject>,
+    pair: &'static str,
+    source: &'static str,
+) -> Result<Vec<DynamicObject>, kube::Error> {
+    crate::queue_metrics::kube_operation("list", pair, source, api.list(&ListParams::default()))
+        .await
+        .map(|objects| objects.items)
 }
 
 fn is_not_found(error: &kube::Error) -> bool {
@@ -553,7 +599,10 @@ async fn send_key(queue: &mpsc::Sender<ReconcileKey>, pair: usize, object: &Dyna
         namespace,
         name: object.name_any(),
     };
-    if queue.send(key).await.is_err() {
+    if crate::queue_metrics::send(queue, key, crate::queue_metrics::Queue::Reconcile)
+        .await
+        .is_err()
+    {
         debug!("reconciliation queue closed");
     }
 }

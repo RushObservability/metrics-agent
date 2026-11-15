@@ -87,6 +87,7 @@ impl Drop for Receiver<'_> {
                 self.metrics.discarded(samples.len(), "receiver_closed");
             }
         }
+        crate::queue_metrics::closed(crate::queue_metrics::Queue::Publish);
     }
 }
 

@@ -821,7 +821,7 @@ async fn run_with_metrics(
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => return,
-            message = scrape_receiver.inner.recv() => {
+            message = crate::queue_metrics::recv(&mut scrape_receiver.inner, crate::queue_metrics::Queue::Publish) => {
                 let Some(message) = message else { return };
                 match message {
                     ScrapeMessage::Start { .. } => {

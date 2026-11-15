@@ -16,3 +16,5 @@ pub(crate) mod discovery_metrics;
 pub mod worker_metrics;
 
 pub(crate) mod scrape_metrics;
+
+pub(crate) mod queue_metrics;

@@ -200,6 +200,7 @@ pub fn render(snapshot: &StatusSnapshot) -> String {
     output.push_str(&crate::discovery_metrics::registry().render());
     output.push_str(&crate::worker_metrics::registry().render());
     output.push_str(&crate::scrape_metrics::registry().render());
+    output.push_str(&crate::queue_metrics::registry().render());
     output
 }
 

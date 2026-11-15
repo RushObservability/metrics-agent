@@ -177,8 +177,8 @@ pub async fn run(
                     }
                     Err(error) => {
                         cycle.outcome = "failed";
-                        let _ = sender
-                            .send(ScrapeMessage::Complete {
+                        let _ = crate::queue_metrics::publish(&sender,
+                            ScrapeMessage::Complete {
                                 targets: 0,
                                 healthy_targets: 0,
                                 samples: 0,
@@ -241,8 +241,7 @@ async fn scrape_once(
         max_line_bytes: controller.config().scrape_max_line_bytes,
     };
     let total = targets.len();
-    sender
-        .send(ScrapeMessage::Start { targets: total })
+    crate::queue_metrics::publish(sender, ScrapeMessage::Start { targets: total })
         .await
         .context("metrics remote-write channel closed")?;
     let mut results = stream::iter((0..total).map(|index| {
@@ -293,15 +292,17 @@ async fn scrape_once(
             ),
         }
     }
-    sender
-        .send(ScrapeMessage::Complete {
+    crate::queue_metrics::publish(
+        sender,
+        ScrapeMessage::Complete {
             targets: total,
             healthy_targets: healthy,
             samples,
             error: None,
-        })
-        .await
-        .context("metrics remote-write channel closed")?;
+        },
+    )
+    .await
+    .context("metrics remote-write channel closed")?;
     Ok((
         total,
         healthy,
@@ -626,18 +627,16 @@ async fn send_metric_chunks(
     for metric in metrics {
         chunk.push(metric);
         if chunk.len() == 10_000 {
-            sender
-                .send(ScrapeMessage::Batch(std::mem::replace(
-                    &mut chunk,
-                    Vec::with_capacity(10_000),
-                )))
-                .await
-                .context("metrics remote-write channel closed")?;
+            crate::queue_metrics::publish(
+                sender,
+                ScrapeMessage::Batch(std::mem::replace(&mut chunk, Vec::with_capacity(10_000))),
+            )
+            .await
+            .context("metrics remote-write channel closed")?;
         }
     }
     if !chunk.is_empty() {
-        sender
-            .send(ScrapeMessage::Batch(chunk))
+        crate::queue_metrics::publish(sender, ScrapeMessage::Batch(chunk))
             .await
             .context("metrics remote-write channel closed")?;
     }
