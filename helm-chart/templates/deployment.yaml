@@ -52,7 +52,6 @@ spec:
             - --log-level={{ .Values.controller.logLevel }}
             - --resync-period={{ .Values.controller.resyncPeriod }}
             - --workers={{ .Values.controller.workers }}
-            - --scrape-enabled={{ .Values.scrape.enabled }}
             - --scrape-interval={{ .Values.scrape.interval }}
             - --scrape-timeout={{ .Values.scrape.timeout }}
             - --scrape-discovery-refresh-interval={{ .Values.scrape.discoveryRefreshInterval }}
@@ -72,6 +71,9 @@ spec:
             - --scrape-allowed-destinations={{ join "," .Values.scrape.allowedDestinations }}
             {{- end }}
           env:
+            # --scrape-enabled is a value-less flag, so true/false goes through the env var.
+            - name: METRICS_AGENT_SCRAPE_ENABLED
+              value: {{ .Values.scrape.enabled | quote }}
             - name: METRICS_AGENT_UI_ENABLED
               value: {{ .Values.ui.enabled | quote }}
             - name: METRICS_AGENT_UI_ADDRESS
