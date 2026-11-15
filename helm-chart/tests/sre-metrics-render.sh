@@ -22,4 +22,8 @@ if helm template health "$chart_dir" --set sreMetrics.enabled=true >/dev/null 2>
   echo 'incomplete SRE configuration was accepted' >&2
   exit 1
 fi
+fanout="$(helm template health "$chart_dir" "${enabled[@]}" --namespace monitoring --set sreMetrics.discovery.enabled=true --set sreMetrics.discovery.serviceName=sre-agent)"
+for expected in 'name: METRICS_AGENT_SRE_METRICS_SERVICE' 'value: "sre-agent"' 'name: METRICS_AGENT_SRE_METRICS_NAMESPACE' 'fieldPath: metadata.namespace'; do
+  grep -Fq "$expected" <<<"$fanout" || { echo "missing replica discovery setting: $expected" >&2; exit 1; }
+done
 echo 'standalone authenticated SRE metrics renders passed'
