@@ -126,6 +126,13 @@ pub struct Config {
     #[arg(long, env = "METRICS_AGENT_SRE_METRICS_TOKEN_FILE")]
     pub sre_metrics_token_file: Option<PathBuf>,
 
+    /// Trusted Kubernetes Service whose ready endpoints are scraped individually.
+    #[arg(long, env = "METRICS_AGENT_SRE_METRICS_SERVICE")]
+    pub sre_metrics_service: Option<String>,
+
+    #[arg(long, env = "METRICS_AGENT_SRE_METRICS_NAMESPACE")]
+    pub sre_metrics_namespace: Option<String>,
+
     #[arg(
         long,
         env = "METRICS_AGENT_SCRAPE_INTERVAL",
