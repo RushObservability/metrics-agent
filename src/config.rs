@@ -521,6 +521,8 @@ mod tests {
                 .is_err()
         );
         assert!(Config::try_parse_from(["metrics-agent", "--ui-enabled=maybe"]).is_err());
+        // The chart must not render this form: --scrape-enabled takes no value.
+        assert!(Config::try_parse_from(["metrics-agent", "--scrape-enabled=true"]).is_err());
         assert!(parse_extra_labels(r#"{"__name__":"invalid"}"#).is_err());
         assert!(parse_extra_labels(r#"{"bad-label":"invalid"}"#).is_err());
         assert!(parse_extra_labels(r#"{"env":1}"#).is_err());
@@ -558,6 +560,7 @@ mod tests {
     fn environment_values_are_loaded_with_the_same_parsers_as_cli_values() {
         let _lock = env_lock().lock().unwrap();
         let _ui = RestoredEnv::set("METRICS_AGENT_UI_ENABLED", "false");
+        let _scrape_enabled = RestoredEnv::set("METRICS_AGENT_SCRAPE_ENABLED", "false");
         let _scrape = RestoredEnv::set("METRICS_AGENT_SCRAPE_INTERVAL", "275ms");
         let _remote_interval = RestoredEnv::set("RUSH_REMOTE_WRITE_INTERVAL", "2m");
         let _url = RestoredEnv::set("RUSH_REMOTE_WRITE_URL", "http://rush.test/write");
@@ -568,6 +571,7 @@ mod tests {
 
         let config = Config::try_parse_from(["metrics-agent"]).unwrap();
         assert!(!config.ui_enabled);
+        assert!(!config.scrape_enabled);
         assert_eq!(config.scrape_interval, Duration::from_millis(275));
         assert_eq!(config.rush_remote_write_interval, Duration::from_secs(120));
         assert_eq!(

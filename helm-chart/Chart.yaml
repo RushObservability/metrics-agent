@@ -2,7 +2,7 @@ apiVersion: v2
 name: metrics-agent
 description: Cluster-wide Prometheus and VictoriaMetrics CRD metric collection with deterministic VM precedence
 type: application
-version: 0.1.2
+version: 0.1.3
 appVersion: "0.1.0"
 kubeVersion: ">=1.27.0-0"
 home: https://rushobservability.com

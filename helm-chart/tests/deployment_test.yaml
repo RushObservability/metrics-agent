@@ -72,6 +72,25 @@ tests:
           content:
             name: METRICS_AGENT_UI_ENABLED
             value: "false"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: METRICS_AGENT_SCRAPE_ENABLED
+            value: "true"
+      - notContains:
+          path: spec.template.spec.containers[0].args
+          content: --scrape-enabled=true
+
+  - it: passes scrape.enabled=false through the env var
+    set:
+      scrape:
+        enabled: false
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: METRICS_AGENT_SCRAPE_ENABLED
+            value: "false"
 
   - it: supports immutable image references
     set:
