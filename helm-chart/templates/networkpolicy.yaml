@@ -16,5 +16,19 @@ spec:
   ingress:
     {{- toYaml .Values.networkPolicy.ingress | nindent 4 }}
   egress:
-    {{- toYaml .Values.networkPolicy.egress | nindent 4 }}
+    {{- with .Values.networkPolicy.egress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+    {{- if and .Values.sreMetrics.enabled .Values.scrape.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: sre-agent
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: http
+    {{- else if not .Values.networkPolicy.egress }}
+    []
+    {{- end }}
 {{- end }}
