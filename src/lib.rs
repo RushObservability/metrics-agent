@@ -10,3 +10,5 @@ pub mod status;
 pub const DEFAULT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub(crate) mod delivery_metrics;
+
+pub(crate) mod discovery_metrics;

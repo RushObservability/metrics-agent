@@ -79,12 +79,19 @@ impl TargetCache {
             .refreshed_at
             .is_some_and(|refreshed_at| refreshed_at.elapsed() < refresh_interval);
         if fresh {
+            crate::discovery_metrics::cache(
+                "fresh",
+                self.refreshed_at
+                    .map_or(0.0, |at| at.elapsed().as_secs_f64()),
+            );
             return Ok((Arc::clone(&self.targets), 0, true));
         }
 
         let started = Instant::now();
         match discover_targets(client, pairs).await {
             Ok(targets) => {
+                crate::discovery_metrics::refresh("complete");
+                crate::discovery_metrics::cache("refreshed", 0.0);
                 let duration_ms = started.elapsed().as_millis() as u64;
                 let targets: Arc<[ScrapeTarget]> = targets.into();
                 self.targets = Arc::clone(&targets);
@@ -92,11 +99,22 @@ impl TargetCache {
                 Ok((targets, duration_ms, false))
             }
             Err(error) => {
+                crate::discovery_metrics::refresh("failed");
+                crate::discovery_metrics::cache(
+                    "refresh_failed",
+                    self.refreshed_at
+                        .map_or(0.0, |at| at.elapsed().as_secs_f64()),
+                );
                 let stale_allowed = self.refreshed_at.is_some_and(|refreshed_at| {
                     refreshed_at.elapsed()
                         < refresh_interval.checked_mul(2).unwrap_or(Duration::MAX)
                 });
                 if stale_allowed && !self.targets.is_empty() {
+                    crate::discovery_metrics::cache(
+                        "stale",
+                        self.refreshed_at
+                            .map_or(0.0, |at| at.elapsed().as_secs_f64()),
+                    );
                     warn!(%error, "scrape target refresh failed; using bounded stale discovery data");
                     Ok((
                         Arc::clone(&self.targets),
@@ -600,11 +618,7 @@ async fn discover_targets(client: Client, pairs: &[ResourcePair]) -> Result<Vec<
     let mut targets = Vec::new();
     for pair in pairs {
         let vm_api = Api::<DynamicObject>::all_with(client.clone(), &pair.victoria);
-        let vm_objects = vm_api
-            .list(&ListParams::default())
-            .await
-            .map(|list| list.items)
-            .unwrap_or_default();
+        let vm_objects = list_discovery_objects(&vm_api, pair.name, "victoria", false).await?;
         let mut selected = Vec::new();
         let mut keys = HashSet::new();
         for object in vm_objects {
@@ -612,11 +626,9 @@ async fn discover_targets(client: Client, pairs: &[ResourcePair]) -> Result<Vec<
             selected.push((object, "victoria"));
         }
         let prom_api = Api::<DynamicObject>::all_with(client.clone(), &pair.prometheus);
-        if let Ok(list) = prom_api.list(&ListParams::default()).await {
-            for object in list.items {
-                if keys.insert(object_key(&object)) {
-                    selected.push((object, "prometheus"));
-                }
+        for object in list_discovery_objects(&prom_api, pair.name, "prometheus", true).await? {
+            if keys.insert(object_key(&object)) {
+                selected.push((object, "prometheus"));
             }
         }
         for (object, source) in selected {
@@ -624,6 +636,35 @@ async fn discover_targets(client: Client, pairs: &[ResourcePair]) -> Result<Vec<
         }
     }
     Ok(deduplicate_targets(targets))
+}
+
+// Only a missing optional Prometheus CRD means an empty source. Other errors
+// invalidate the whole refresh so the bounded previous discovery remains intact.
+async fn list_discovery_objects(
+    api: &Api<DynamicObject>,
+    pair: &'static str,
+    source: &'static str,
+    optional: bool,
+) -> Result<Vec<DynamicObject>> {
+    match api.list(&ListParams::default()).await {
+        Ok(list) => {
+            crate::discovery_metrics::request(pair, source, "success");
+            Ok(list.items)
+        }
+        Err(kube::Error::Api(error)) if optional && error.code == 404 => {
+            crate::discovery_metrics::request(pair, source, "not_installed");
+            Ok(Vec::new())
+        }
+        Err(error) => {
+            let outcome = match &error {
+                kube::Error::Api(response) if matches!(response.code, 401 | 403) => "forbidden",
+                kube::Error::Api(response) if matches!(response.code, 408 | 504) => "timeout",
+                _ => "api_error",
+            };
+            crate::discovery_metrics::request(pair, source, outcome);
+            Err(error).context("refresh scrape CRD discovery")
+        }
+    }
 }
 
 async fn load_discovery_data(client: &Client) -> Result<DiscoveryData> {
@@ -1603,5 +1644,83 @@ mod tests {
 
         store.begin_scrape().await;
         assert!(store.snapshot().await.crd_metric_cardinality.is_empty());
+    }
+    #[tokio::test]
+    async fn failed_crd_refresh_preserves_previous_targets_until_stale_deadline() {
+        use axum::{
+            Json, Router,
+            http::{StatusCode, Uri},
+            response::IntoResponse,
+        };
+        use std::{
+            sync::{
+                Arc,
+                atomic::{AtomicU16, Ordering},
+            },
+            time::{Duration, Instant},
+        };
+        let response_code = Arc::new(AtomicU16::new(403));
+        let response = response_code.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().fallback(move |uri: Uri| { let response = response.clone(); async move {
+                if uri.path().contains("operator.victoriametrics.com") {
+                    (StatusCode::from_u16(response.load(Ordering::SeqCst)).unwrap(), Json(json!({"apiVersion":"v1","kind":"Status","status":"Failure","message":"list failed","reason":"Forbidden","code":response.load(Ordering::SeqCst)}))).into_response()
+                } else { Json(json!({"apiVersion":"v1","kind":"List","metadata":{},"items":[]})).into_response() }
+            }})).await.unwrap();
+        });
+        let client = kube::Client::try_from(kube::Config::new(endpoint.parse().unwrap())).unwrap();
+        let mut cache = super::TargetCache {
+            refreshed_at: Some(Instant::now() - Duration::from_secs(15)),
+            targets: vec![ScrapeTarget {
+                url: "http://old:80/metrics".into(),
+                labels: vec![],
+                identity: identity("service-monitor", "victoria"),
+            }]
+            .into(),
+        };
+        let pairs = crate::controller::resource_pairs();
+        let (retained, _, stale) = cache
+            .get(client.clone(), &pairs, Duration::from_secs(10))
+            .await
+            .unwrap();
+        assert!(stale);
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].url, "http://old:80/metrics");
+        cache.refreshed_at = Some(Instant::now() - Duration::from_secs(21));
+        assert!(
+            cache
+                .get(client, &pairs, Duration::from_secs(10))
+                .await
+                .is_err()
+        );
+        assert_eq!(cache.targets.len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn only_optional_missing_crd_is_a_successful_empty_source() {
+        use axum::{Json, Router, http::StatusCode};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().fallback(|| async { (StatusCode::NOT_FOUND, Json(json!({"apiVersion":"v1","kind":"Status","status":"Failure","message":"missing","reason":"NotFound","code":404}))) })).await.unwrap();
+        });
+        let client = kube::Client::try_from(kube::Config::new(endpoint.parse().unwrap())).unwrap();
+        let pair = crate::controller::resource_pairs().remove(0);
+        let api = kube::Api::all_with(client, &pair.prometheus);
+        assert!(
+            super::list_discovery_objects(&api, pair.name, "prometheus", true)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            super::list_discovery_objects(&api, pair.name, "victoria", false)
+                .await
+                .is_err()
+        );
+        server.abort();
     }
 }
