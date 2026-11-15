@@ -218,13 +218,8 @@ async fn scrape_once(
             controller.config().scrape_discovery_refresh_interval,
         )
         .await?;
-    let targets = if let Some(target) = internal_target::target(controller.config())? {
-        let mut combined = targets.to_vec();
-        combined.push(target);
-        Arc::<[ScrapeTarget]>::from(combined)
-    } else {
-        targets
-    };
+    let internal = internal_target::targets(controller.config(), controller.kube_client()).await;
+    let (targets, unavailable_internal_sources) = internal_target::combine(targets, internal);
     let limits = ScrapeLimits {
         max_response_bytes: controller.config().scrape_max_response_bytes,
         max_retained_bytes: controller.config().scrape_max_retained_bytes,
@@ -235,12 +230,13 @@ async fn scrape_once(
         max_metric_name_bytes: controller.config().scrape_max_metric_name_bytes,
         max_line_bytes: controller.config().scrape_max_line_bytes,
     };
-    let total = targets.len();
+    let target_count = targets.len();
+    let total = target_count.saturating_add(unavailable_internal_sources);
     sender
         .send(ScrapeMessage::Start { targets: total })
         .await
         .context("metrics remote-write channel closed")?;
-    let mut results = stream::iter((0..total).map(|index| {
+    let mut results = stream::iter((0..target_count).map(|index| {
         let targets = Arc::clone(&targets);
         async move {
             let target = &targets[index];

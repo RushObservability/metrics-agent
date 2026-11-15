@@ -87,6 +87,18 @@ spec:
               value: {{ required "sreMetrics.url is required" .Values.sreMetrics.url | quote }}
             - name: METRICS_AGENT_SRE_METRICS_TOKEN_FILE
               value: /var/run/rush-sre-metrics/token
+            {{- if .Values.sreMetrics.discovery.enabled }}
+            - name: METRICS_AGENT_SRE_METRICS_SERVICE
+              value: {{ required "sreMetrics.discovery.serviceName is required" .Values.sreMetrics.discovery.serviceName | quote }}
+            - name: METRICS_AGENT_SRE_METRICS_NAMESPACE
+              {{- if .Values.sreMetrics.discovery.namespace }}
+              value: {{ .Values.sreMetrics.discovery.namespace | quote }}
+              {{- else }}
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+              {{- end }}
+            {{- end }}
             {{- end }}
             {{- if .Values.rushRemoteWrite.enabled }}
             {{- if and (not .Values.rushRemoteWrite.bearerTokenSecret.name) (not .Values.rushRemoteWrite.allowAnonymous) }}
