@@ -1,12 +1,59 @@
 use std::{
-    collections::BTreeMap, env, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration,
+    collections::BTreeMap, env, net::SocketAddr, path::PathBuf, str::FromStr, sync::LazyLock,
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use fundu::{
+    CustomDurationParser, CustomDurationParserBuilder, CustomTimeUnit, Multiplier, TimeUnit,
+};
 
 fn parse_duration(value: &str) -> Result<Duration, String> {
-    humantime::parse_duration(value).map_err(|error| error.to_string())
+    use TimeUnit::{Day, Hour, MicroSecond, MilliSecond, Minute, NanoSecond, Second, Week};
+
+    // Keep the duration suffixes and fixed month/year lengths accepted by existing configs.
+    static PARSER: LazyLock<CustomDurationParser<'static>> = LazyLock::new(|| {
+        CustomDurationParserBuilder::new()
+            .time_units(&[
+                CustomTimeUnit::with_default(NanoSecond, &["nanos", "nsec", "ns"]),
+                CustomTimeUnit::with_default(MicroSecond, &["usec", "us", "µs"]),
+                CustomTimeUnit::with_default(MilliSecond, &["millis", "msec", "ms"]),
+                CustomTimeUnit::with_default(Second, &["seconds", "second", "secs", "sec", "s"]),
+                CustomTimeUnit::with_default(Minute, &["minutes", "minute", "min", "mins", "m"]),
+                CustomTimeUnit::with_default(Hour, &["hours", "hour", "hr", "hrs", "h"]),
+                CustomTimeUnit::with_default(Day, &["days", "day", "d"]),
+                CustomTimeUnit::with_default(Week, &["weeks", "week", "wk", "wks", "w"]),
+                CustomTimeUnit::new(
+                    Second,
+                    &["months", "month", "M"],
+                    Some(Multiplier(2_630_016, 0)),
+                ),
+                CustomTimeUnit::new(
+                    Second,
+                    &["years", "year", "yr", "yrs", "y"],
+                    Some(Multiplier(31_557_600, 0)),
+                ),
+            ])
+            .allow_time_unit_delimiter()
+            .parse_multiple(None)
+            .disable_exponent()
+            .disable_infinity()
+            .build()
+    });
+    if value == "0" {
+        return Ok(Duration::ZERO);
+    }
+    let value = value.trim();
+    if !value.ends_with(char::is_alphabetic) {
+        return Err("duration requires a time unit".to_string());
+    }
+    let duration = PARSER.parse(value).map_err(|error| error.to_string())?;
+    let duration = Duration::try_from(duration).map_err(|error| error.to_string())?;
+    if duration == Duration::MAX {
+        return Err("duration is too large".to_string());
+    }
+    Ok(duration)
 }
 
 fn parse_positive_usize(value: &str) -> Result<usize, String> {
@@ -373,6 +420,18 @@ mod tests {
         let _lock = env_lock().lock().unwrap();
         assert_eq!(parse_duration("1.5s").unwrap(), Duration::from_millis(1500));
         assert_eq!(parse_duration("0s").unwrap(), Duration::ZERO);
+        assert_eq!(parse_duration("0").unwrap(), Duration::ZERO);
+        assert_eq!(
+            parse_duration(" 1hr30min 2 µs ").unwrap(),
+            Duration::new(5400, 2000)
+        );
+        assert_eq!(
+            parse_duration("1M 1yr").unwrap(),
+            Duration::from_secs(34_187_616)
+        );
+        assert!(parse_duration("10").is_err());
+        assert!(parse_duration("1e4s").is_err());
+        assert!(parse_duration("999999999999999999999y").is_err());
         assert!(parse_duration("not-a-duration").is_err());
     }
 
