@@ -1,9 +1,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::Utc;
+use jiff::Timestamp;
 use prost::Message;
 use reqwest::header::{CONTENT_ENCODING, CONTENT_TYPE};
 
@@ -310,7 +309,7 @@ fn encode(
                     labels,
                     samples: vec![Sample {
                         value,
-                        timestamp: Utc::now().timestamp_millis(),
+                        timestamp: Timestamp::now().as_millisecond(),
                     }],
                 },
             ));
@@ -891,7 +890,7 @@ async fn run_with_metrics(
                                 }
                             }
                         }
-                        let timestamp = humantime::format_rfc3339_seconds(SystemTime::now()).to_string();
+                        let timestamp = format!("{:.0}", Timestamp::now());
                         let duration_ms = cycle_started
                             .take()
                             .map(|started| started.elapsed().as_millis() as u64)
@@ -916,7 +915,7 @@ async fn run_with_metrics(
                         if snapshot.scrape.enabled && snapshot.scrape.targets > 0 {
                             continue;
                         }
-                        let timestamp = humantime::format_rfc3339_seconds(SystemTime::now()).to_string();
+                        let timestamp = format!("{:.0}", Timestamp::now());
                         let started = std::time::Instant::now();
                         match publish_inner(
                             &client,

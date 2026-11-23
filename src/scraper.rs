@@ -14,6 +14,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use futures_util::{StreamExt, stream};
+use jiff::{Timestamp, tz::Offset};
 use kube::{
     Client,
     api::{Api, ApiResource, DynamicObject, ListParams, ResourceExt},
@@ -156,7 +157,7 @@ pub async fn run(
                 let started = Instant::now();
                 let result = scrape_once(&controller, &http, &sender, &mut target_cache).await;
                 let duration_ms = started.elapsed().as_millis() as u64;
-                let timestamp = chrono::Utc::now().to_rfc3339();
+                let timestamp = Timestamp::now().display_with_offset(Offset::UTC).to_string();
                 match result {
                     Ok((targets, healthy, samples, discovery_duration_ms, discovery_cache_hit)) => {
                         if healthy == targets { crate::worker_metrics::success("scrape"); }
@@ -361,7 +362,7 @@ async fn fetch_target(
     parse_bounded_response(
         response,
         &target.labels,
-        chrono::Utc::now().timestamp_millis(),
+        Timestamp::now().as_millisecond(),
         limits,
     )
     .await
