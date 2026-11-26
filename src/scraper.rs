@@ -1482,10 +1482,17 @@ mod tests {
     #[test]
     fn monitor_discovery_intersects_expression_and_destination_policy() {
         let mut data = discovery_data();
-        for (kind, expand) in [
-            ("service-monitor", service_targets as fn(_, _, _, _) -> _),
-            ("pod-monitor", pod_targets as fn(_, _, _, _) -> _),
-        ] {
+        type Expand = fn(
+            &serde_json::Value,
+            &TargetIdentity,
+            &DiscoveryData,
+            &mut DiscoveredTargets,
+        ) -> anyhow::Result<()>;
+        let monitors: [(&str, Expand); 2] = [
+            ("service-monitor", service_targets),
+            ("pod-monitor", pod_targets),
+        ];
+        for (kind, expand) in monitors {
             let identity = identity(kind, "prometheus");
             let make_spec = |expression| {
                 json!({
