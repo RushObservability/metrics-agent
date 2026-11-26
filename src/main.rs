@@ -135,10 +135,8 @@ async fn main() -> Result<()> {
                 }
             },
             async {
-                if !remote_writer_finished {
-                    if let Err(error) = (&mut remote_write_task).await {
-                        error!(%error, "remote writer task failed during shutdown");
-                    }
+                if !remote_writer_finished && let Err(error) = (&mut remote_write_task).await {
+                    error!(%error, "remote writer task failed during shutdown");
                 }
             },
         );

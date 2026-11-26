@@ -961,18 +961,12 @@ mod tests {
 
     #[test]
     fn not_found_detection_only_matches_api_404() {
-        let not_found = kube::Error::Api(kube::error::ErrorResponse {
-            status: "Failure".to_string(),
-            message: "missing".to_string(),
-            reason: "NotFound".to_string(),
-            code: 404,
-        });
-        let forbidden = kube::Error::Api(kube::error::ErrorResponse {
-            status: "Failure".to_string(),
-            message: "denied".to_string(),
-            reason: "Forbidden".to_string(),
-            code: 403,
-        });
+        let not_found = kube::Error::Api(Box::new(
+            kube::core::Status::failure("missing", "NotFound").with_code(404),
+        ));
+        let forbidden = kube::Error::Api(Box::new(
+            kube::core::Status::failure("denied", "Forbidden").with_code(403),
+        ));
         assert!(is_not_found(&not_found));
         assert!(!is_not_found(&forbidden));
     }

@@ -946,34 +946,32 @@ async fn run_with_metrics(
                 }
             }
             _ = interval.tick(), if !draining => {
-                if !cycle_active {
-                    if let Some(url) = url.as_deref() {
-                        let snapshot = status.metrics_snapshot().await;
-                        // Once workload targets are active, their completed
-                        // cycle is the meaningful "last payload". Do not
-                        // overwrite that count with a small self-health-only
-                        // heartbeat between scrape cycles.
-                        if snapshot.scrape.enabled && snapshot.scrape.targets > 0 {
-                            continue;
-                        }
-                        let timestamp = format!("{:.0}", Timestamp::now());
-                        let started = std::time::Instant::now();
-                        match publish_inner(
-                            &client,
-                            url,
-                            Some(&snapshot),
-                            Vec::new(),
-                            PublishOptions {
-                                token: token.as_deref(),
-                                tenant: tenant.as_deref(),
-                                extra_labels: &extra_labels,
-                                include_self: true,
-                                delivery,
-                            },
-                        ).await {
-                            Ok(result) => status.set_remote_write_result(Some(result.series), Some(result.samples), timestamp, started.elapsed().as_millis() as u64, None).await,
-                            Err(error) => status.set_remote_write_result(None, None, timestamp, started.elapsed().as_millis() as u64, Some(error.to_string())).await,
-                        }
+                if let Some(url) = url.as_deref().filter(|_| !cycle_active) {
+                    let snapshot = status.metrics_snapshot().await;
+                    // Once workload targets are active, their completed
+                    // cycle is the meaningful "last payload". Do not
+                    // overwrite that count with a small self-health-only
+                    // heartbeat between scrape cycles.
+                    if snapshot.scrape.enabled && snapshot.scrape.targets > 0 {
+                        continue;
+                    }
+                    let timestamp = format!("{:.0}", Timestamp::now());
+                    let started = std::time::Instant::now();
+                    match publish_inner(
+                        &client,
+                        url,
+                        Some(&snapshot),
+                        Vec::new(),
+                        PublishOptions {
+                            token: token.as_deref(),
+                            tenant: tenant.as_deref(),
+                            extra_labels: &extra_labels,
+                            include_self: true,
+                            delivery,
+                        },
+                    ).await {
+                        Ok(result) => status.set_remote_write_result(Some(result.series), Some(result.samples), timestamp, started.elapsed().as_millis() as u64, None).await,
+                        Err(error) => status.set_remote_write_result(None, None, timestamp, started.elapsed().as_millis() as u64, Some(error.to_string())).await,
                     }
                 }
             }

@@ -258,12 +258,9 @@ mod tests {
     }
     #[tokio::test]
     async fn kube_outcomes_preserve_forbidden_and_cancelled_operations() {
-        let error = kube::Error::Api(kube::core::ErrorResponse {
-            status: "Failure".into(),
-            message: "private object".into(),
-            reason: "Forbidden".into(),
-            code: 403,
-        });
+        let error = kube::Error::Api(Box::new(
+            kube::core::Status::failure("private object", "Forbidden").with_code(403),
+        ));
         assert!(
             kube_operation("patch", "service-monitor", "victoria", async {
                 Err::<(), _>(error)

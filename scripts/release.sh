@@ -18,7 +18,7 @@ done
 # has a cargo shim that can't run. Fail before any branch is created.
 if ! cargo --version >/dev/null 2>&1; then
   echo "cargo is installed but can't choose a Rust toolchain here." >&2
-  echo "Set a default (rustup default stable) or pick one for this run: RUSTUP_TOOLCHAIN=1.88.0 make release" >&2
+  echo "Set a default (rustup default stable) or pick one for this run: RUSTUP_TOOLCHAIN=1.89.0 make release" >&2
   exit 1
 fi
 
