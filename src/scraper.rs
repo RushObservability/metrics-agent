@@ -908,7 +908,7 @@ fn service_targets(
                 if endpoint_namespace.is_some_and(|namespace| namespace != service_namespace) {
                     continue;
                 }
-                let instance = format!("{ip}:{port}");
+                let instance = host_port(ip, port);
                 targets.push(ScrapeTarget {
                     url: build_url(scheme, &instance, path),
                     labels: vec![
@@ -964,7 +964,7 @@ fn pod_targets(
                 .get("scheme")
                 .and_then(Value::as_str)
                 .unwrap_or("http");
-            let instance = format!("{ip}:{port}");
+            let instance = host_port(ip, port);
             targets.push(ScrapeTarget {
                 url: build_url(scheme, &instance, path),
                 labels: vec![
@@ -998,13 +998,20 @@ fn static_targets(
         .and_then(Value::as_str)
         .unwrap_or("/metrics");
     for config in configs {
-        let labels = config
+        let mut labels = config
             .get("labels")
             .and_then(Value::as_object)
             .into_iter()
             .flatten()
             .map(|(key, value)| (key.clone(), value.as_str().unwrap_or_default().to_string()))
             .collect::<Vec<_>>();
+        if let Some((invalid, _)) = labels.iter().find(|(key, _)| !valid_static_label_name(key)) {
+            warn!(source = identity.source, kind = identity.pair, namespace = identity.namespace, name = identity.name, label = %invalid, "skipping static scrape config with an invalid label name");
+            continue;
+        }
+        // The CRD's own namespace always wins so a static label cannot claim
+        // another tenant's namespace.
+        labels.retain(|(key, _)| key != "namespace");
         for target in config
             .get("targets")
             .and_then(Value::as_array)
@@ -1019,6 +1026,7 @@ fn static_targets(
             if !target_labels.iter().any(|(key, _)| key == "instance") {
                 target_labels.push(("instance".into(), target.to_string()));
             }
+            target_labels.push(("namespace".into(), identity.namespace.clone()));
             targets.push(ScrapeTarget {
                 url: normalize_target(target, scheme, path),
                 labels: target_labels,
@@ -1027,6 +1035,16 @@ fn static_targets(
         }
     }
     Ok(())
+}
+
+/// Prometheus label names, excluding the reserved `__` prefix.
+fn valid_static_label_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+        && !name.starts_with("__")
 }
 
 fn probe_targets(
@@ -1056,6 +1074,7 @@ fn probe_targets(
             labels: vec![
                 ("job".into(), identity.name.clone()),
                 ("instance".into(), target.into()),
+                ("namespace".into(), identity.namespace.clone()),
             ],
             identity: identity.clone(),
         })?;
@@ -1166,6 +1185,15 @@ fn pod_port(pod: &Value, requested: Option<&Value>) -> Option<u16> {
                 None
             }
         })
+}
+
+/// `ip:port` as Prometheus writes it: IPv6 is bracketed so the URL and the
+/// `instance` label parse.
+fn host_port(ip: &str, port: u16) -> String {
+    match ip.parse::<IpAddr>() {
+        Ok(ip) => std::net::SocketAddr::new(ip, port).to_string(),
+        Err(_) => format!("{ip}:{port}"),
+    }
 }
 
 fn build_url(scheme: &str, host: &str, path: &str) -> String {
@@ -1449,6 +1477,111 @@ mod tests {
         );
     }
 
+    fn discovery_data_at(ip: &str, port: u16) -> DiscoveryData {
+        let mut data = discovery_data();
+        let endpoints = data
+            .endpoints
+            .get_mut(&("default".into(), "api".into()))
+            .unwrap();
+        endpoints["subsets"][0]["addresses"][0]["ip"] = json!(ip);
+        endpoints["subsets"][0]["ports"][0]["port"] = json!(port);
+        let pod = &mut data.pods.get_mut("default").unwrap()[0];
+        pod["status"]["podIP"] = json!(ip);
+        pod["spec"]["containers"][0]["ports"][0]["containerPort"] = json!(port);
+        data
+    }
+
+    /// One ServiceMonitor target and one PodMonitor target, expanded separately
+    /// because both point at the same address and would be deduplicated.
+    fn endpoint_and_pod_targets(data: &DiscoveryData) -> Vec<ScrapeTarget> {
+        let spec = json!({
+            "selector": {"matchLabels": {"app": "api"}},
+            "namespaceSelector": {"matchNames": ["default"]},
+            "endpoints": [{"port": "metrics"}]
+        });
+        let mut service = DiscoveredTargets::new(1);
+        service_targets(
+            &spec,
+            &identity("service-monitor", "prometheus"),
+            data,
+            &mut service,
+        )
+        .unwrap();
+        let mut pod = DiscoveredTargets::new(1);
+        pod_targets(
+            &spec,
+            &identity("pod-monitor", "prometheus"),
+            data,
+            &mut pod,
+        )
+        .unwrap();
+        let targets = [service.items, pod.items].concat();
+        assert_eq!(targets.len(), 2);
+        targets
+    }
+
+    #[tokio::test]
+    async fn ipv6_endpoints_and_pods_are_bracketed_and_scrapeable() {
+        use clap::Parser;
+        for target in endpoint_and_pod_targets(&discovery_data_at("fd00::1", 8080)) {
+            assert_eq!(target.url, "http://[fd00::1]:8080/metrics");
+            assert!(
+                target
+                    .labels
+                    .contains(&("instance".into(), "[fd00::1]:8080".into()))
+            );
+            assert!(validate_scrape_url(&target.url, &[]).is_ok());
+        }
+
+        let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route("/metrics", axum::routing::get(|| async { "up 1\n" })),
+            )
+            .await
+            .unwrap();
+        });
+        let mut config = crate::config::Config::parse_from(["test"]);
+        config.scrape_allowed_destinations = vec!["::1".into()];
+        let http =
+            super::scrape_client(std::time::Duration::from_secs(2), vec!["::1".into()]).unwrap();
+        for target in endpoint_and_pod_targets(&discovery_data_at("::1", port)) {
+            assert_eq!(target.url, format!("http://[::1]:{port}/metrics"));
+            let samples = super::fetch_target(&http, &target, &config, ScrapeLimits::default())
+                .await
+                .unwrap();
+            assert_eq!(samples[0].name, "up");
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn bracketed_ipv6_targets_still_hit_the_destination_policy() {
+        use clap::Parser;
+        let config = crate::config::Config::parse_from(["test"]);
+        let http = super::scrape_client(std::time::Duration::from_secs(1), vec![]).unwrap();
+        for ip in ["fd00:ec2::254", "fe80::1", "::1", "::ffff:169.254.169.254"] {
+            for target in endpoint_and_pod_targets(&discovery_data_at(ip, 8080)) {
+                assert_eq!(target.url, format!("http://[{ip}]:8080/metrics"));
+                assert!(validate_scrape_url(&target.url, &[]).is_err(), "{ip}");
+                let error = super::fetch_target(&http, &target, &config, ScrapeLimits::default())
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(
+                        error.downcast_ref::<crate::scrape_metrics::Failure>(),
+                        Some(crate::scrape_metrics::Failure(
+                            crate::scrape_metrics::Outcome::PolicyDenied
+                        ))
+                    ),
+                    "{ip}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn builds_pod_monitor_targets_from_named_container_ports() {
         let spec = json!({
@@ -1534,6 +1667,33 @@ mod tests {
                 .labels
                 .contains(&("instance".into(), "https://example.com/a?x=1".into()))
         );
+        assert!(
+            targets[0]
+                .labels
+                .contains(&("namespace".into(), "monitoring".into()))
+        );
+    }
+
+    #[test]
+    fn static_labels_cannot_spoof_namespace_or_use_invalid_names() {
+        let spec = json!({
+            "staticConfigs": [
+                {"targets": ["node-a:9100"], "labels": {"namespace": "payments", "team": "a"}},
+                {"targets": ["node-b:9100"], "labels": {"__address__": "x"}},
+                {"targets": ["node-c:9100"], "labels": {"bad-name": "x"}}
+            ]
+        });
+        let mut targets = DiscoveredTargets::new(3);
+        static_targets(&spec, &identity("scrape-config", "victoria"), &mut targets).unwrap();
+        let targets = targets.items;
+        assert_eq!(targets.len(), 1);
+        let namespaces = targets[0]
+            .labels
+            .iter()
+            .filter(|(key, _)| key == "namespace")
+            .collect::<Vec<_>>();
+        assert_eq!(namespaces, [&("namespace".into(), "monitoring".into())]);
+        assert!(targets[0].labels.contains(&("team".into(), "a".into())));
     }
 
     #[test]

@@ -36,6 +36,13 @@ into HTTP targets. Scrapes run with fixed limits for concurrency, response
 bytes, line length, labels, and samples. One bad exporter fails its own scrape;
 it does not consume an unbounded amount of agent memory.
 
+Target labels (`job`, `namespace`, `service` or `pod`, `instance`) win over
+labels the exporter returns, like Prometheus `honor_labels: false`. A clashing
+exporter label is kept as `exported_<name>`. `ScrapeConfig` and `Probe` targets
+always carry the namespace of their CRD object; static labels cannot set
+`namespace`, and a static config with an invalid or `__`-prefixed label name is
+skipped with a warning.
+
 **Writes directly to Rush.** Workload samples and the agent's own health
 metrics are sent to query-api in Snappy-compressed remote-write requests. The
 agent streams bounded batches instead of holding a complete scrape cycle in

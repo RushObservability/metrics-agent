@@ -562,19 +562,33 @@ impl PrometheusTextParser {
             )
             .into());
         }
+        // Like Prometheus `honor_labels: false`: target labels win, so a target
+        // cannot claim another job or namespace. A clashing scraped label is
+        // kept as `exported_<name>`, prefixed again until the name is free.
         let mut merged = self.target_labels.clone();
+        let mut clashes = Vec::new();
         for label in labels {
-            if let Some(existing) = merged.iter_mut().find(|(key, _)| key == &label.name) {
-                existing.1 = label.value;
+            if self.target_labels.iter().any(|(key, _)| *key == label.name) {
+                clashes.push((label.name, label.value));
             } else {
-                if merged.len() >= self.limits.max_labels_per_sample {
+                push_scraped_label(&mut merged, (label.name, label.value), self.limits)?;
+            }
+        }
+        clashes.sort_by_key(|(name, _)| name.len());
+        for (mut name, value) in clashes {
+            loop {
+                name.insert_str(0, "exported_");
+                if name.len() > self.limits.max_label_name_bytes {
                     return Err(crate::scrape_metrics::ResourceLimit(
-                        "Prometheus sample exceeds the configured label-count limit",
+                        "Prometheus label name exceeds the configured byte limit",
                     )
                     .into());
                 }
-                merged.push((label.name, label.value));
+                if !merged.iter().any(|(key, _)| *key == name) {
+                    break;
+                }
             }
+            push_scraped_label(&mut merged, (name, value), self.limits)?;
         }
         let sample_bytes = std::mem::size_of::<CollectedMetric>()
             + name.len()
@@ -630,6 +644,21 @@ impl PrometheusTextParser {
         }
         Ok(self.samples)
     }
+}
+
+fn push_scraped_label(
+    merged: &mut Vec<(String, String)>,
+    label: (String, String),
+    limits: ScrapeLimits,
+) -> Result<()> {
+    if merged.len() >= limits.max_labels_per_sample {
+        return Err(crate::scrape_metrics::ResourceLimit(
+            "Prometheus sample exceeds the configured label-count limit",
+        )
+        .into());
+    }
+    merged.push(label);
+    Ok(())
 }
 
 fn validate_target_labels(target_labels: &[(String, String)], limits: ScrapeLimits) -> Result<()> {
@@ -1206,12 +1235,55 @@ request_total{job="scrape",path="a\\b\"c\n",code="200"} 3.5 1700000000123
         assert_eq!(
             samples[0].labels,
             vec![
-                ("job".into(), "scrape".into()),
+                ("job".into(), "target-job".into()),
                 ("cluster".into(), "prod".into()),
                 ("path".into(), "a\\b\"c\n".into()),
                 ("code".into(), "200".into()),
+                ("exported_job".into(), "scrape".into()),
             ]
         );
+    }
+
+    #[test]
+    fn scraped_labels_cannot_replace_target_labels() {
+        let target = [
+            ("job".into(), "team-a-api".into()),
+            ("namespace".into(), "team-a".into()),
+            ("instance".into(), "10.0.0.7:8080".into()),
+        ];
+        let samples = parse_prometheus_text(
+            "http_requests_total{job=\"payments-api\",namespace=\"payments\",exported_namespace=\"x\"} 1\n",
+            &target,
+            42,
+            ScrapeLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            samples[0].labels,
+            vec![
+                ("job".into(), "team-a-api".into()),
+                ("namespace".into(), "team-a".into()),
+                ("instance".into(), "10.0.0.7:8080".into()),
+                ("exported_namespace".into(), "x".into()),
+                ("exported_job".into(), "payments-api".into()),
+                ("exported_exported_namespace".into(), "payments".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn exported_labels_respect_label_limits() {
+        let target = [("job".into(), "api".into())];
+        let name_limits = ScrapeLimits {
+            max_label_name_bytes: 8,
+            ..ScrapeLimits::default()
+        };
+        assert!(parse_prometheus_text("a{job=\"x\"} 1\n", &target, 42, name_limits).is_err());
+        let count_limits = ScrapeLimits {
+            max_labels_per_sample: 1,
+            ..ScrapeLimits::default()
+        };
+        assert!(parse_prometheus_text("a{job=\"x\"} 1\n", &target, 42, count_limits).is_err());
     }
 
     #[test]
