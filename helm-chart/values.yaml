@@ -38,6 +38,9 @@ scrape:
   maxMetricNameBytes: 1024
   maxLineBytes: 65536
   # Empty allows scrape objects from every namespace visible to the agent.
+  # Probe and ScrapeConfig objects can name any host, so unless
+  # allowedTargetNamespaces is ["*"] they are only read from namespaces listed
+  # here explicitly.
   allowedNamespaces: []
   # Workload target namespaces for ServiceMonitor and PodMonitor. Empty keeps
   # each monitor in its own namespace. Set ["*"] to allow every namespace.

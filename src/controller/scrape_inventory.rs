@@ -29,6 +29,10 @@ impl ScrapeInventory {
         }
     }
 
+    pub fn allowed_namespaces(&self) -> &[String] {
+        &self.allowed_namespaces
+    }
+
     pub(super) fn insert(&self, objects: &mut Objects, object: &DynamicObject) {
         if let Some(selected) = self.select(object) {
             objects.insert(object_key(object), selected);

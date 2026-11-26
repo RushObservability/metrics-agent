@@ -63,6 +63,7 @@ struct DiscoveryData {
     endpoints: HashMap<(String, String), Value>,
     pods: BTreeMap<String, Vec<Value>>,
     allowed_target_namespaces: Vec<String>,
+    allowed_source_namespaces: Vec<String>,
 }
 
 #[derive(Default)]
@@ -692,6 +693,7 @@ async fn discover_targets(
     let mut data =
         load_discovery_data(&client, needs("service-monitor"), needs("pod-monitor")).await?;
     data.allowed_target_namespaces = allowed_target_namespaces.to_vec();
+    data.allowed_source_namespaces = inventory.allowed_namespaces().to_vec();
     let mut targets = DiscoveredTargets::new(max_targets);
     for (pair, source, object) in selected {
         targets_for_object(pair, source, &object, &data, &mut targets)?;
@@ -717,6 +719,7 @@ async fn load_discovery_data(
             .collect(),
         pods: index_namespaces(pods),
         allowed_target_namespaces: Vec::new(),
+        allowed_source_namespaces: Vec::new(),
     })
 }
 
@@ -837,6 +840,16 @@ fn targets_for_object(
         name: object.name.clone(),
     };
     let spec = &object.spec;
+    if matches!(pair, "probe" | "scrape-config") && !arbitrary_hosts_allowed(object, data) {
+        warn!(
+            source = identity.source,
+            kind = identity.pair,
+            namespace = identity.namespace,
+            name = identity.name,
+            "skipping scrape object that can name any host; list its namespace in the allowed scrape namespaces or allow all target namespaces"
+        );
+        return Ok(());
+    }
     match pair {
         "service-monitor" => service_targets(spec, &identity, data, targets),
         "pod-monitor" => pod_targets(spec, &identity, data, targets),
@@ -844,6 +857,19 @@ fn targets_for_object(
         "scrape-config" => static_targets(spec, &identity, targets),
         _ => Ok(()),
     }
+}
+
+/// Probe and ScrapeConfig objects name hosts directly, so the per-namespace
+/// target restriction cannot apply to them. While that restriction is on, only
+/// namespaces the operator listed explicitly may define them.
+fn arbitrary_hosts_allowed(object: &ScrapeObject, data: &DiscoveryData) -> bool {
+    data.allowed_target_namespaces
+        .iter()
+        .any(|name| name.trim() == "*")
+        || data
+            .allowed_source_namespaces
+            .iter()
+            .any(|name| name.trim() == object.namespace)
 }
 
 fn monitor_selection(
@@ -909,8 +935,11 @@ fn service_targets(
                     continue;
                 }
                 let instance = format!("{ip}:{port}");
+                let Some(url) = endpoint_url(scheme, ip, port, path, identity) else {
+                    continue;
+                };
                 targets.push(ScrapeTarget {
-                    url: build_url(scheme, &instance, path),
+                    url,
                     labels: vec![
                         ("job".into(), identity.name.clone()),
                         ("namespace".into(), service_namespace.clone()),
@@ -965,8 +994,11 @@ fn pod_targets(
                 .and_then(Value::as_str)
                 .unwrap_or("http");
             let instance = format!("{ip}:{port}");
+            let Some(url) = endpoint_url(scheme, ip, port, path, identity) else {
+                continue;
+            };
             targets.push(ScrapeTarget {
-                url: build_url(scheme, &instance, path),
+                url,
                 labels: vec![
                     ("job".into(), identity.name.clone()),
                     ("namespace".into(), pod_namespace.clone()),
@@ -1178,6 +1210,36 @@ fn build_url(scheme: &str, host: &str, path: &str) -> String {
         }
     )
 }
+/// Builds a ServiceMonitor or PodMonitor URL that can only reach the
+/// discovered endpoint, whatever the monitor's scheme and path contain.
+fn endpoint_url(
+    scheme: &str,
+    ip: &str,
+    port: u16,
+    path: &str,
+    identity: &TargetIdentity,
+) -> Option<String> {
+    let scheme = scheme.to_ascii_lowercase();
+    let url = matches!(scheme.as_str(), "http" | "https")
+        .then(|| build_url(&scheme, &format!("{ip}:{port}"), path));
+    let points_at_endpoint = url
+        .as_deref()
+        .and_then(|url| Url::parse(url).ok())
+        .is_some_and(|url| url.host_str() == Some(ip) && url.port_or_known_default() == Some(port));
+    if !points_at_endpoint {
+        warn!(
+            source = identity.source,
+            kind = identity.pair,
+            namespace = identity.namespace,
+            name = identity.name,
+            scheme,
+            path,
+            "skipping Kubernetes scrape endpoint whose scheme or path does not address the discovered endpoint"
+        );
+        return None;
+    }
+    url
+}
 fn normalize_target(target: &str, scheme: &str, path: &str) -> String {
     if target.starts_with("http://") || target.starts_with("https://") {
         target.to_string()
@@ -1379,6 +1441,7 @@ mod tests {
     fn discovery_data() -> DiscoveryData {
         DiscoveryData {
             allowed_target_namespaces: vec!["default".into()],
+            allowed_source_namespaces: Vec::new(),
             services: index_namespaces(vec![json!({
                 "metadata": {
                     "name": "api",
@@ -1590,6 +1653,137 @@ mod tests {
             targets[0].identity.key,
             "prometheus:service-monitor:monitoring/api-monitor"
         );
+    }
+
+    #[test]
+    fn monitor_scheme_and_path_cannot_redirect_to_another_host() {
+        type Expand = fn(
+            &serde_json::Value,
+            &TargetIdentity,
+            &DiscoveryData,
+            &mut DiscoveredTargets,
+        ) -> anyhow::Result<()>;
+        let monitors: [(&str, &str, &str, Expand); 2] = [
+            (
+                "service-monitor",
+                "endpoints",
+                "10.0.0.1:9100",
+                service_targets,
+            ),
+            (
+                "pod-monitor",
+                "podMetricsEndpoints",
+                "10.0.0.2:8080",
+                pod_targets,
+            ),
+        ];
+        for (kind, field, endpoint_address, expand) in monitors {
+            let discover = |scheme: &str, path: &str| {
+                let spec = json!({
+                    "selector": {"matchLabels": {"app": "api"}},
+                    "namespaceSelector": {"matchNames": ["default"]},
+                    field: [{"port": "metrics", "scheme": scheme, "path": path}]
+                });
+                let mut targets = DiscoveredTargets::new(2);
+                expand(
+                    &spec,
+                    &identity(kind, "prometheus"),
+                    &discovery_data(),
+                    &mut targets,
+                )
+                .unwrap();
+                targets.items
+            };
+            for scheme in [
+                "http://10.4.2.9:9100/metrics?x=",
+                "http://10.4.2.9:9100/metrics#",
+                "https://10.4.2.9:9100",
+                "file",
+                "",
+            ] {
+                assert!(discover(scheme, "/metrics").is_empty(), "{kind} {scheme:?}");
+            }
+            for (scheme, expected) in [("http", "http"), ("HTTPS", "https")] {
+                let targets = discover(scheme, "/metrics");
+                assert_eq!(targets.len(), 1, "{kind} {scheme}");
+                assert_eq!(
+                    targets[0].url,
+                    format!("{expected}://{endpoint_address}/metrics")
+                );
+            }
+            // The path is always rooted after the endpoint, so it cannot change the authority.
+            for path in [
+                "@10.4.2.9:9100/metrics",
+                "//10.4.2.9:9100/metrics",
+                "\\\\10.4.2.9:9100/metrics",
+                ":81/metrics",
+            ] {
+                for target in discover("http", path) {
+                    let url = reqwest::Url::parse(&target.url).unwrap();
+                    assert_eq!(
+                        format!("{}:{}", url.host_str().unwrap(), url.port().unwrap()),
+                        endpoint_address,
+                        "{kind} {path:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn endpoint_url_requires_the_url_to_address_the_endpoint() {
+        let identity = identity("service-monitor", "prometheus");
+        assert_eq!(
+            super::endpoint_url("http", "10.0.0.1", 80, "metrics", &identity).as_deref(),
+            Some("http://10.0.0.1:80/metrics")
+        );
+        assert!(super::endpoint_url("http", "evil.example/x?", 80, "/", &identity).is_none());
+        assert!(super::endpoint_url("http", "10.0.0.1:81/x?", 80, "/", &identity).is_none());
+    }
+
+    #[test]
+    fn host_naming_objects_need_an_explicitly_allowed_namespace() {
+        let probe = ScrapeObject {
+            namespace: "monitoring".into(),
+            name: "probe".into(),
+            spec: json!({
+                "prober": {"url": "http://blackbox:9115/probe"},
+                "targets": {"staticConfig": {"static": ["10.4.2.9:9100"]}}
+            }),
+        };
+        let scrape_config = ScrapeObject {
+            namespace: "monitoring".into(),
+            name: "static".into(),
+            spec: json!({"staticConfigs": [{"targets": ["10.4.2.9:9100"]}]}),
+        };
+        let discovered = |data: &DiscoveryData| {
+            let mut targets = DiscoveredTargets::new(4);
+            targets_for_object("probe", "prometheus", &probe, data, &mut targets).unwrap();
+            targets_for_object(
+                "scrape-config",
+                "victoria",
+                &scrape_config,
+                data,
+                &mut targets,
+            )
+            .unwrap();
+            targets.items.len()
+        };
+
+        let mut data = discovery_data();
+        // Restriction on, source namespaces unrestricted or not listing it.
+        data.allowed_target_namespaces.clear();
+        assert_eq!(discovered(&data), 0);
+        data.allowed_target_namespaces = vec!["default".into()];
+        data.allowed_source_namespaces = vec!["apps".into()];
+        assert_eq!(discovered(&data), 0);
+        // Restriction on, namespace listed explicitly.
+        data.allowed_source_namespaces = vec!["apps".into(), " monitoring ".into()];
+        assert_eq!(discovered(&data), 2);
+        // Restriction off.
+        data.allowed_source_namespaces.clear();
+        data.allowed_target_namespaces = vec!["*".into()];
+        assert_eq!(discovered(&data), 2);
     }
 
     #[test]

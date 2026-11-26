@@ -222,7 +222,8 @@ pub struct Config {
     pub scrape_max_targets: usize,
 
     /// Source namespaces whose scrape objects may create targets. Empty means
-    /// all namespaces visible to the controller.
+    /// all namespaces visible to the controller. Probe and ScrapeConfig objects
+    /// are only read from namespaces listed here unless target namespaces is *.
     #[arg(
         long,
         env = "METRICS_AGENT_SCRAPE_ALLOWED_NAMESPACES",
@@ -231,7 +232,8 @@ pub struct Config {
     pub scrape_allowed_namespaces: Vec<String>,
 
     /// Destination namespaces for ServiceMonitor and PodMonitor targets.
-    /// Empty restricts each monitor to its own namespace. Use * to allow all.
+    /// Empty restricts each monitor to its own namespace. Use * to allow all
+    /// and to accept Probe and ScrapeConfig objects from any allowed namespace.
     #[arg(
         long,
         env = "METRICS_AGENT_SCRAPE_ALLOWED_TARGET_NAMESPACES",
