@@ -424,10 +424,10 @@ mod tests {
     struct TokenFile(PathBuf);
     impl TokenFile {
         fn new() -> Self {
-            let unique = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
+            // A clock alone collides between parallel tests (macOS has microsecond resolution),
+            // and one test's Drop then deletes the other's token file.
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Self(std::env::temp_dir().join(format!(
                 "metrics-agent-test-token-{}-{unique}",
                 std::process::id()
