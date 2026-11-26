@@ -755,6 +755,7 @@ mod tests {
         let mut cache = TargetCache {
             refreshed_at: Some(std::time::Instant::now()),
             targets: vec![cached].into(),
+            watches: Default::default(),
         };
         let http = super::super::scrape_client(
             std::time::Duration::from_secs(2),

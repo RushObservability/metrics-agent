@@ -32,7 +32,8 @@ equivalents. It marks native VictoriaMetrics objects so the operator's
 Prometheus converter does not overwrite them.
 
 **Discovers and scrapes targets.** Services, Endpoints, and Pods are resolved
-into HTTP targets. Scrapes run with fixed limits for concurrency, response
+into HTTP targets. They are listed once, when a monitor first needs them, and
+then kept current by watches that hold only names, labels, ports, and IPs. Scrapes run with fixed limits for concurrency, response
 bytes, line length, labels, and samples. One bad exporter fails its own scrape;
 it does not consume an unbounded amount of agent memory.
 
