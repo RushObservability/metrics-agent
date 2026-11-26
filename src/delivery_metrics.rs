@@ -7,6 +7,14 @@ pub(crate) fn global() -> &'static DeliveryMetrics {
     METRICS.get_or_init(DeliveryMetrics::default)
 }
 impl DeliveryMetrics {
+    pub fn retry(&self, outcome: &'static str) {
+        self.0.counter(
+            "metrics_agent_remote_write_retries_total",
+            &[("outcome", outcome)],
+            1,
+        );
+    }
+
     pub fn discarded(&self, samples: usize, reason: &'static str) {
         self.0.counter(
             "metrics_agent_remote_write_samples_total",
