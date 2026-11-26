@@ -39,6 +39,9 @@ scrape:
   maxLineBytes: 65536
   # Empty allows scrape objects from every namespace visible to the agent.
   allowedNamespaces: []
+  # Workload target namespaces for ServiceMonitor and PodMonitor. Empty keeps
+  # each monitor in its own namespace. Set ["*"] to allow every namespace.
+  allowedTargetNamespaces: []
   # Exact hosts/IPs and `*.suffix` patterns that may override the built-in
   # block on loopback, link-local, metadata, and Kubernetes API destinations.
   allowedDestinations: []
