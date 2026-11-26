@@ -504,6 +504,7 @@ pub struct PrometheusTextParser {
     types: HashMap<String, i32>,
     samples: Vec<CollectedMetric>,
     retained_bytes: usize,
+    target_label_bytes: usize,
 }
 
 impl PrometheusTextParser {
@@ -513,11 +514,11 @@ impl PrometheusTextParser {
         limits: ScrapeLimits,
     ) -> Result<Self> {
         validate_target_labels(target_labels, limits)?;
-        let retained_bytes = target_labels
+        let target_label_bytes = target_labels
             .iter()
             .map(|(name, value)| name.len() + value.len() + std::mem::size_of::<(String, String)>())
             .sum::<usize>();
-        if retained_bytes > limits.max_retained_bytes {
+        if target_label_bytes > limits.max_retained_bytes {
             return Err(crate::scrape_metrics::ResourceLimit(
                 "decoded scrape exceeds the configured retained-byte limit",
             )
@@ -530,7 +531,8 @@ impl PrometheusTextParser {
             helps: HashMap::new(),
             types: HashMap::new(),
             samples: Vec::new(),
-            retained_bytes,
+            retained_bytes: target_label_bytes,
+            target_label_bytes,
         })
     }
 
@@ -631,9 +633,11 @@ impl PrometheusTextParser {
             }
             labels = kept;
         }
-        // Target labels and HELP are shared, and charged once in `new` and
-        // when the HELP line is read.
+        // Target labels are shared here but copied into every series when the
+        // batch is encoded, so they count per sample. HELP is sent once per
+        // family and is charged once when the HELP line is read.
         let sample_bytes = std::mem::size_of::<CollectedMetric>()
+            + self.target_label_bytes
             + name.len()
             + labels
                 .iter()
@@ -1052,13 +1056,13 @@ mod tests {
     };
 
     #[test]
-    fn decoded_budget_charges_shared_labels_and_help_once() {
+    fn decoded_budget_charges_target_labels_per_sample_and_help_once() {
         let limits = ScrapeLimits {
             max_retained_bytes: 2048,
             ..ScrapeLimits::default()
         };
         // Target labels and HELP are shared by every sample, not copied.
-        let labels = [("shared".into(), "x".repeat(1024))];
+        let labels = [("shared".into(), "x".repeat(400))];
         let samples = parse_prometheus_text("a 1\na 2\n", &labels, 0, limits).unwrap();
         assert!(Arc::ptr_eq(
             &samples[0].target_labels,
@@ -1068,8 +1072,10 @@ mod tests {
         assert!(body.len() < limits.max_response_bytes);
         let samples = parse_prometheus_text(&body, &[], 0, limits).unwrap();
         assert!(Arc::ptr_eq(&samples[0].help, &samples[1].help));
-        // Each shared copy still counts once, and per-sample values count per sample.
-        let body = format!("a 1\n# HELP a {}\n", "x".repeat(1024));
+        // The encoder copies target labels into every series, so they count per
+        // sample. HELP is sent once per family and counts once.
+        let err = parse_prometheus_text("a 1\na 2\na 3\na 4\n", &labels, 0, limits).unwrap_err();
+        assert!(err.to_string().contains("retained-byte"));
         assert!(
             parse_prometheus_text(&body, &labels, 0, limits)
                 .unwrap_err()
@@ -1083,6 +1089,26 @@ mod tests {
                 .to_string()
                 .contains("retained-byte")
         );
+    }
+
+    #[test]
+    fn decoded_budget_rejects_large_target_labels_times_many_samples() {
+        use std::fmt::Write;
+
+        // 60 static labels of 4 KiB each on a target serving 50,000 tiny samples:
+        // the body is under 0.5 MB, but encoding one batch would copy the labels
+        // into every series (gigabytes), so the default budget must reject it.
+        let limits = ScrapeLimits::default();
+        let labels = (0..60)
+            .map(|i| (format!("l{i}"), "x".repeat(limits.max_label_value_bytes)))
+            .collect::<Vec<_>>();
+        let mut body = String::new();
+        for i in 0..50_000 {
+            writeln!(body, "m{i} 1").unwrap();
+        }
+        assert!(body.len() < limits.max_response_bytes);
+        let err = parse_prometheus_text(&body, &labels, 0, limits).unwrap_err();
+        assert!(err.to_string().contains("retained-byte"));
     }
 
     #[test]
