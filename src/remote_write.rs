@@ -66,11 +66,24 @@ pub enum MetricType {
 #[derive(Clone, Debug)]
 pub struct CollectedMetric {
     pub name: String,
+    /// Labels of the scrape target, shared by every sample from that scrape.
+    /// No name here may also appear in `labels`; the parser renames clashing
+    /// scraped labels to `exported_<name>`.
+    pub target_labels: Arc<[(String, String)]>,
     pub labels: Vec<(String, String)>,
     pub value: f64,
     pub timestamp: i64,
-    pub help: String,
+    /// Shared by every sample of the metric family.
+    pub help: Arc<str>,
     pub metric_type: MetricType,
+}
+
+#[cfg(test)]
+impl CollectedMetric {
+    /// Target labels followed by scraped labels, as written to remote write.
+    pub(crate) fn all_labels(&self) -> impl Iterator<Item = &(String, String)> {
+        self.target_labels.iter().chain(&self.labels)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -182,7 +195,7 @@ async fn publish_inner(
     let extra_labels = options.extra_labels.clone();
     let include_self = options.include_self;
     let (payload, compressed) = tokio::task::spawn_blocking(move || {
-        let payload = encode(snapshot.as_ref(), &scraped, &extra_labels, include_self)?;
+        let payload = encode(snapshot.as_ref(), scraped, &extra_labels, include_self)?;
         let compressed = snap::raw::Encoder::new()
             .compress_vec(&payload.bytes)
             .context("compress remote-write payload")?;
@@ -282,16 +295,20 @@ struct EncodedPayload {
 
 fn encode(
     snapshot: Option<&StatusSnapshot>,
-    scraped: &[CollectedMetric],
+    scraped: Vec<CollectedMetric>,
     extra_labels: &BTreeMap<String, String>,
     include_self: bool,
 ) -> Result<EncodedPayload> {
-    let mut helps = HashMap::new();
-    let mut types = HashMap::new();
-    let mut series = Vec::new();
+    // Metric family -> (type, HELP). A later series of the same family
+    // replaces the entry, so scraped metadata wins over self metadata.
+    let mut families: BTreeMap<String, (i32, Arc<str>)> = BTreeMap::new();
+    let mut series = Vec::with_capacity(scraped.len());
 
     if include_self {
         let snapshot = snapshot.context("self metrics require a status snapshot")?;
+        let mut helps = HashMap::new();
+        let mut types = HashMap::new();
+        let mut names = Vec::new();
         let exposition = metrics::render(snapshot);
         for line in exposition.lines() {
             if let Some(help) = line.strip_prefix("# HELP ") {
@@ -340,66 +357,82 @@ fn encode(
             }
             merge_extra_labels(&mut labels, extra_labels);
             labels.sort_by(|left, right| left.name.cmp(&right.name));
-            series.push((
-                name.to_string(),
-                TimeSeries {
-                    labels,
-                    samples: vec![Sample {
-                        value,
-                        timestamp: Timestamp::now().as_millisecond(),
-                    }],
-                },
-            ));
+            names.push(name.to_string());
+            series.push(TimeSeries {
+                labels,
+                samples: vec![Sample {
+                    value,
+                    timestamp: Timestamp::now().as_millisecond(),
+                }],
+            });
+        }
+        for name in names {
+            let kind = types
+                .get(&name)
+                .copied()
+                .unwrap_or(MetricType::Gauge as i32);
+            let help = helps.get(&name).map_or("", String::as_str).into();
+            families.insert(name, (kind, help));
         }
     }
 
     for metric in scraped {
-        let mut labels = metric
-            .labels
-            .iter()
-            .filter(|(name, _)| name != "__name__")
-            .map(|(name, value)| Label {
-                name: name.clone(),
-                value: value.clone(),
-            })
-            .collect::<Vec<_>>();
+        let mut labels = Vec::with_capacity(
+            metric.target_labels.len() + metric.labels.len() + extra_labels.len() + 1,
+        );
+        labels.extend(
+            metric
+                .target_labels
+                .iter()
+                .filter(|(name, _)| name != "__name__")
+                .map(|(name, value)| Label {
+                    name: name.clone(),
+                    value: value.clone(),
+                }),
+        );
+        labels.extend(
+            metric
+                .labels
+                .into_iter()
+                .filter(|(name, _)| name != "__name__")
+                .map(|(name, value)| Label { name, value }),
+        );
+        let family = (metric.metric_type as i32, metric.help);
+        match families.get_mut(metric.name.as_str()) {
+            Some(entry) => *entry = family,
+            None => {
+                families.insert(metric.name.clone(), family);
+            }
+        }
         labels.push(Label {
             name: "__name__".to_string(),
-            value: metric.name.clone(),
+            value: metric.name,
         });
         merge_extra_labels(&mut labels, extra_labels);
         labels.sort_by(|left, right| left.name.cmp(&right.name));
-        helps.insert(metric.name.clone(), metric.help.clone());
-        types.insert(metric.name.clone(), metric.metric_type as i32);
-        series.push((
-            metric.name.clone(),
-            TimeSeries {
-                labels,
-                samples: vec![Sample {
-                    value: metric.value,
-                    timestamp: metric.timestamp,
-                }],
-            },
-        ));
+        series.push(TimeSeries {
+            labels,
+            samples: vec![Sample {
+                value: metric.value,
+                timestamp: metric.timestamp,
+            }],
+        });
     }
 
-    let mut metadata = BTreeMap::new();
-    for (name, _) in &series {
-        metadata
-            .entry(name.clone())
-            .or_insert_with(|| MetricMetadata {
-                r#type: types.get(name).copied().unwrap_or(MetricType::Gauge as i32),
-                metric_family_name: name.clone(),
-                help: helps.get(name).cloned().unwrap_or_default(),
-            });
-    }
     let samples = series
         .iter()
-        .map(|(_, time_series)| time_series.samples.len() as u64)
+        .map(|time_series| time_series.samples.len() as u64)
         .sum();
     let request = WriteRequest {
-        timeseries: series.into_iter().map(|(_, series)| series).collect(),
-        metadata: metadata.into_values().collect(),
+        timeseries: series,
+        metadata: families
+            .into_iter()
+            .map(|(name, (kind, help))| MetricMetadata {
+                r#type: kind,
+                metric_family_name: name,
+                help: help.to_string(),
+            })
+            .collect(),
     };
     Ok(EncodedPayload {
         bytes: request.encode_to_vec(),
@@ -464,10 +497,10 @@ pub fn parse_prometheus_text(
 /// Incremental Prometheus text parser used by the HTTP scraper. It retains
 /// parsed samples and metadata, but never the complete response body.
 pub struct PrometheusTextParser {
-    target_labels: Vec<(String, String)>,
+    target_labels: Arc<[(String, String)]>,
     default_timestamp: i64,
     limits: ScrapeLimits,
-    helps: HashMap<String, String>,
+    helps: HashMap<String, Arc<str>>,
     types: HashMap<String, i32>,
     samples: Vec<CollectedMetric>,
     retained_bytes: usize,
@@ -491,7 +524,7 @@ impl PrometheusTextParser {
             .into());
         }
         Ok(Self {
-            target_labels: target_labels.to_vec(),
+            target_labels: target_labels.into(),
             default_timestamp,
             limits,
             helps: HashMap::new(),
@@ -523,7 +556,7 @@ impl PrometheusTextParser {
                     .get(name)
                     .map_or(0, |value| name.len() + value.len() + 128);
                 self.charge_retained((name.len() + description.len() + 128).saturating_sub(old))?;
-                self.helps.insert(name.to_string(), description.to_string());
+                self.helps.insert(name.to_string(), description.into());
             }
             return Ok(());
         }
@@ -562,37 +595,47 @@ impl PrometheusTextParser {
             )
             .into());
         }
+        if self.target_labels.len() + labels.len() > self.limits.max_labels_per_sample {
+            return Err(crate::scrape_metrics::ResourceLimit(
+                "Prometheus sample exceeds the configured label-count limit",
+            )
+            .into());
+        }
+        let mut labels = labels
+            .into_iter()
+            .map(|label| (label.name, label.value))
+            .collect::<Vec<_>>();
         // Like Prometheus `honor_labels: false`: target labels win, so a target
         // cannot claim another job or namespace. A clashing scraped label is
         // kept as `exported_<name>`, prefixed again until the name is free.
-        let mut merged = self.target_labels.clone();
-        let mut clashes = Vec::new();
-        for label in labels {
-            if self.target_labels.iter().any(|(key, _)| *key == label.name) {
-                clashes.push((label.name, label.value));
-            } else {
-                push_scraped_label(&mut merged, (label.name, label.value), self.limits)?;
-            }
-        }
-        clashes.sort_by_key(|(name, _)| name.len());
-        for (mut name, value) in clashes {
-            loop {
-                name.insert_str(0, "exported_");
-                if name.len() > self.limits.max_label_name_bytes {
-                    return Err(crate::scrape_metrics::ResourceLimit(
-                        "Prometheus label name exceeds the configured byte limit",
-                    )
-                    .into());
+        let target = &self.target_labels;
+        let is_target = |key: &str| target.iter().any(|(name, _)| name == key);
+        if labels.iter().any(|(key, _)| is_target(key)) {
+            let (mut clashes, mut kept): (Vec<_>, Vec<_>) =
+                labels.into_iter().partition(|(key, _)| is_target(key));
+            clashes.sort_by_key(|(name, _)| name.len());
+            for (mut name, value) in clashes {
+                loop {
+                    name.insert_str(0, "exported_");
+                    if name.len() > self.limits.max_label_name_bytes {
+                        return Err(crate::scrape_metrics::ResourceLimit(
+                            "Prometheus label name exceeds the configured byte limit",
+                        )
+                        .into());
+                    }
+                    if !is_target(&name) && !kept.iter().any(|(key, _)| *key == name) {
+                        break;
+                    }
                 }
-                if !merged.iter().any(|(key, _)| *key == name) {
-                    break;
-                }
+                kept.push((name, value));
             }
-            push_scraped_label(&mut merged, (name, value), self.limits)?;
+            labels = kept;
         }
+        // Target labels and HELP are shared, and charged once in `new` and
+        // when the HELP line is read.
         let sample_bytes = std::mem::size_of::<CollectedMetric>()
             + name.len()
-            + merged
+            + labels
                 .iter()
                 .map(|(name, value)| {
                     name.len() + value.len() + std::mem::size_of::<(String, String)>()
@@ -601,10 +644,11 @@ impl PrometheusTextParser {
         self.charge_retained(sample_bytes)?;
         self.samples.push(CollectedMetric {
             name: name.to_string(),
-            labels: merged,
+            target_labels: Arc::clone(&self.target_labels),
+            labels,
             value,
             timestamp,
-            help: String::new(),
+            help: Arc::default(),
             metric_type: MetricType::Gauge,
         });
         Ok(())
@@ -628,13 +672,11 @@ impl PrometheusTextParser {
     }
 
     pub fn finish(mut self) -> Result<Vec<CollectedMetric>> {
-        // HELP may arrive after samples. Account for every copy before cloning.
-        let help_bytes = self.samples.iter().fold(0usize, |total, sample| {
-            total.saturating_add(self.helps.get(&sample.name).map_or(0, String::len))
-        });
-        self.charge_retained(help_bytes)?;
+        // HELP may arrive after samples. Samples share the family's text.
         for sample in &mut self.samples {
-            sample.help = self.helps.get(&sample.name).cloned().unwrap_or_default();
+            if let Some(help) = self.helps.get(&sample.name) {
+                sample.help = Arc::clone(help);
+            }
             sample.metric_type = self
                 .types
                 .get(&sample.name)
@@ -644,21 +686,6 @@ impl PrometheusTextParser {
         }
         Ok(self.samples)
     }
-}
-
-fn push_scraped_label(
-    merged: &mut Vec<(String, String)>,
-    label: (String, String),
-    limits: ScrapeLimits,
-) -> Result<()> {
-    if merged.len() >= limits.max_labels_per_sample {
-        return Err(crate::scrape_metrics::ResourceLimit(
-            "Prometheus sample exceeds the configured label-count limit",
-        )
-        .into());
-    }
-    merged.push(label);
-    Ok(())
 }
 
 fn validate_target_labels(target_labels: &[(String, String)], limits: ScrapeLimits) -> Result<()> {
@@ -732,8 +759,7 @@ fn parse_labels_bounded(raw: &str, limits: ScrapeLimits) -> Result<Vec<Label>> {
     }
     let bytes = raw.as_bytes();
     let mut cursor = 0;
-    let mut labels = Vec::new();
-    let mut names = HashSet::new();
+    let mut labels: Vec<Label> = Vec::new();
     while cursor < bytes.len() {
         while bytes.get(cursor) == Some(&b',') || bytes.get(cursor) == Some(&b' ') {
             cursor += 1;
@@ -752,7 +778,7 @@ fn parse_labels_bounded(raw: &str, limits: ScrapeLimits) -> Result<Vec<Label>> {
             )
             .into());
         }
-        if !names.insert(key) {
+        if labels.iter().any(|label| label.name == key) {
             bail!("Prometheus sample contains a duplicate label name");
         }
         cursor += 1;
@@ -763,13 +789,27 @@ fn parse_labels_bounded(raw: &str, limits: ScrapeLimits) -> Result<Vec<Label>> {
         let mut value = String::new();
         let mut closed = false;
         while cursor < bytes.len() {
-            match bytes[cursor] {
-                b'\"' => {
+            // Copy everything up to the next quote or escape in one slice.
+            let run = bytes[cursor..]
+                .iter()
+                .position(|byte| matches!(byte, b'\"' | b'\\'))
+                .unwrap_or(bytes.len() - cursor);
+            if value.len() + run > limits.max_label_value_bytes {
+                return Err(crate::scrape_metrics::ResourceLimit(
+                    "Prometheus label value exceeds the configured byte limit",
+                )
+                .into());
+            }
+            value.push_str(&raw[cursor..cursor + run]);
+            cursor += run;
+            match bytes.get(cursor) {
+                None => break,
+                Some(b'\"') => {
                     cursor += 1;
                     closed = true;
                     break;
                 }
-                b'\\' => {
+                Some(_) => {
                     if cursor + 1 >= bytes.len() {
                         bail!("Prometheus label value contains an invalid escape");
                     }
@@ -788,20 +828,6 @@ fn parse_labels_bounded(raw: &str, limits: ScrapeLimits) -> Result<Vec<Label>> {
                     }
                     value.push(character);
                     cursor += 1;
-                }
-                _ => {
-                    let character = raw[cursor..]
-                        .chars()
-                        .next()
-                        .context("invalid UTF-8 boundary in Prometheus label value")?;
-                    if value.len() + character.len_utf8() > limits.max_label_value_bytes {
-                        return Err(crate::scrape_metrics::ResourceLimit(
-                            "Prometheus label value exceeds the configured byte limit",
-                        )
-                        .into());
-                    }
-                    value.push(character);
-                    cursor += character.len_utf8();
                 }
             }
         }
@@ -1010,13 +1036,15 @@ async fn run_with_metrics(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
 
     use prost::Message;
 
     use super::{
-        CollectedMetric, MetricType, PrometheusTextParser, ScrapeLimits, WriteRequest, encode,
-        parse_labels, parse_prometheus_text,
+        CollectedMetric, Label, MetricMetadata, MetricType, PrometheusTextParser, Sample,
+        ScrapeLimits, TimeSeries, WriteRequest, encode, merge_extra_labels, parse_labels,
+        parse_prometheus_text,
     };
     use crate::status::{
         CountersStatus, ProcessStatus, RemoteWriteStatus, ScrapeStatus, StatusSnapshot, Totals,
@@ -1024,20 +1052,31 @@ mod tests {
     };
 
     #[test]
-    fn decoded_budget_rejects_repeated_label_and_help_expansion() {
+    fn decoded_budget_charges_shared_labels_and_help_once() {
         let limits = ScrapeLimits {
             max_retained_bytes: 2048,
             ..ScrapeLimits::default()
         };
+        // Target labels and HELP are shared by every sample, not copied.
         let labels = [("shared".into(), "x".repeat(1024))];
+        let samples = parse_prometheus_text("a 1\na 2\n", &labels, 0, limits).unwrap();
+        assert!(Arc::ptr_eq(
+            &samples[0].target_labels,
+            &samples[1].target_labels
+        ));
+        let body = format!("a 1\na 2\n# HELP a {}\n", "x".repeat(1024));
+        assert!(body.len() < limits.max_response_bytes);
+        let samples = parse_prometheus_text(&body, &[], 0, limits).unwrap();
+        assert!(Arc::ptr_eq(&samples[0].help, &samples[1].help));
+        // Each shared copy still counts once, and per-sample values count per sample.
+        let body = format!("a 1\n# HELP a {}\n", "x".repeat(1024));
         assert!(
-            parse_prometheus_text("a 1\na 2\n", &labels, 0, limits)
+            parse_prometheus_text(&body, &labels, 0, limits)
                 .unwrap_err()
                 .to_string()
                 .contains("retained-byte")
         );
-        let body = format!("a 1\na 2\n# HELP a {}\n", "x".repeat(1024));
-        assert!(body.len() < limits.max_response_bytes);
+        let body = format!("a{{v=\"{0}\"}} 1\nb{{v=\"{0}\"}} 2\n", "x".repeat(1024));
         assert!(
             parse_prometheus_text(&body, &[], 0, limits)
                 .unwrap_err()
@@ -1067,7 +1106,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(normal.len(), 1);
-        assert_eq!(normal[0].help, "Request count.");
+        assert_eq!(&*normal[0].help, "Request count.");
     }
 
     #[tokio::test]
@@ -1201,11 +1240,10 @@ mod tests {
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].name, "http_requests_total");
         assert_eq!(samples[0].timestamp, 1700000000123);
-        assert_eq!(samples[0].help, "Requests.");
+        assert_eq!(&*samples[0].help, "Requests.");
         assert!(
             samples[0]
-                .labels
-                .iter()
+                .all_labels()
                 .any(|(key, value)| key == "job" && value == "api")
         );
     }
@@ -1230,10 +1268,10 @@ request_total{job="scrape",path="a\\b\"c\n",code="200"} 3.5 1700000000123
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].value, 3.5);
         assert_eq!(samples[0].timestamp, 1700000000123);
-        assert_eq!(samples[0].help, "Requests.");
+        assert_eq!(&*samples[0].help, "Requests.");
         assert_eq!(samples[0].metric_type, MetricType::Counter);
         assert_eq!(
-            samples[0].labels,
+            samples[0].all_labels().cloned().collect::<Vec<_>>(),
             vec![
                 ("job".into(), "target-job".into()),
                 ("cluster".into(), "prod".into()),
@@ -1259,7 +1297,7 @@ request_total{job="scrape",path="a\\b\"c\n",code="200"} 3.5 1700000000123
         )
         .unwrap();
         assert_eq!(
-            samples[0].labels,
+            samples[0].all_labels().cloned().collect::<Vec<_>>(),
             vec![
                 ("job".into(), "team-a-api".into()),
                 ("namespace".into(), "team-a".into()),
@@ -1412,22 +1450,24 @@ request_total{job="scrape",path="a\\b\"c\n",code="200"} 3.5 1700000000123
         parser.push_line("# TYPE requests_total counter").unwrap();
         let samples = parser.finish().unwrap();
         assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0].help, "Requests.");
+        assert_eq!(&*samples[0].help, "Requests.");
         assert_eq!(samples[0].metric_type, MetricType::Counter);
-        assert_eq!(samples[0].labels, vec![("job".into(), "api".into())]);
+        assert!(samples[0].labels.is_empty());
+        assert_eq!(*samples[0].target_labels, [("job".into(), "api".into())]);
     }
 
     #[test]
     fn encodes_protobuf_with_sorted_merged_labels_and_metadata() {
         let metric = CollectedMetric {
             name: "http_requests_total".into(),
+            target_labels: Default::default(),
             labels: vec![("zone".into(), "west".into()), ("job".into(), "api".into())],
             value: 9.5,
             timestamp: 1700000000123,
             help: "Total requests.".into(),
             metric_type: MetricType::Counter,
         };
-        let encoded = encode(None, &[metric], &BTreeMap::new(), false).unwrap();
+        let encoded = encode(None, vec![metric], &BTreeMap::new(), false).unwrap();
         assert_eq!(encoded.series, 1);
         assert_eq!(encoded.samples, 1);
 
@@ -1453,17 +1493,112 @@ request_total{job="scrape",path="a\\b\"c\n",code="200"} 3.5 1700000000123
         assert_eq!(request.timeseries[0].samples[0].timestamp, 1700000000123);
     }
 
+    /// The scraped-metric encoder before target labels and HELP were shared,
+    /// kept to check that the current encoder writes the same bytes.
+    fn previous_encode(
+        scraped: &[CollectedMetric],
+        extra_labels: &BTreeMap<String, String>,
+    ) -> Vec<u8> {
+        let mut helps = HashMap::new();
+        let mut types = HashMap::new();
+        let mut series = Vec::new();
+        for metric in scraped {
+            let mut labels = metric
+                .all_labels()
+                .filter(|(name, _)| name != "__name__")
+                .map(|(name, value)| Label {
+                    name: name.clone(),
+                    value: value.clone(),
+                })
+                .collect::<Vec<_>>();
+            labels.push(Label {
+                name: "__name__".to_string(),
+                value: metric.name.clone(),
+            });
+            merge_extra_labels(&mut labels, extra_labels);
+            labels.sort_by(|left, right| left.name.cmp(&right.name));
+            helps.insert(metric.name.clone(), metric.help.to_string());
+            types.insert(metric.name.clone(), metric.metric_type as i32);
+            series.push((
+                metric.name.clone(),
+                TimeSeries {
+                    labels,
+                    samples: vec![Sample {
+                        value: metric.value,
+                        timestamp: metric.timestamp,
+                    }],
+                },
+            ));
+        }
+        let mut metadata = BTreeMap::new();
+        for (name, _) in &series {
+            metadata
+                .entry(name.clone())
+                .or_insert_with(|| MetricMetadata {
+                    r#type: types.get(name).copied().unwrap_or(MetricType::Gauge as i32),
+                    metric_family_name: name.clone(),
+                    help: helps.get(name).cloned().unwrap_or_default(),
+                });
+        }
+        WriteRequest {
+            timeseries: series.into_iter().map(|(_, series)| series).collect(),
+            metadata: metadata.into_values().collect(),
+        }
+        .encode_to_vec()
+    }
+
+    #[test]
+    fn encoder_output_matches_the_previous_encoder() {
+        let mut metrics = parse_prometheus_text(
+            r#"# HELP requests_total Requests.
+# TYPE requests_total counter
+requests_total{code="200",job="spoof",exported_job="x",path="a\\b\"c\n"} 1 100
+requests_total{code="500",env="prod",zone="東京"} 2 100
+queue_depth{__name__="spoofed",worker="1"} 3
+# HELP queue_depth Late help.
+"#,
+            &[
+                ("job".into(), "api".into()),
+                ("namespace".into(), "team-a".into()),
+                ("instance".into(), "10.0.0.7:8080".into()),
+            ],
+            42,
+            ScrapeLimits::default(),
+        )
+        .unwrap();
+        // A later sample of a family with other metadata wins, as before.
+        metrics.push(CollectedMetric {
+            name: "requests_total".into(),
+            target_labels: Default::default(),
+            labels: vec![("code".into(), "404".into())],
+            value: 4.0,
+            timestamp: 7,
+            help: "Other help.".into(),
+            metric_type: MetricType::Gauge,
+        });
+        let extra_labels = BTreeMap::from([
+            ("cluster".to_string(), "c1".to_string()),
+            ("env".to_string(), "dev".to_string()),
+            ("job".to_string(), "pinned".to_string()),
+        ]);
+        let expected = previous_encode(&metrics, &extra_labels);
+        let encoded = encode(None, metrics, &extra_labels, false).unwrap();
+        assert_eq!(encoded.bytes, expected);
+        assert_eq!((encoded.series, encoded.samples), (4, 4));
+    }
+
     #[test]
     fn encoder_keeps_only_the_canonical_metric_name_label() {
         let metric = CollectedMetric {
             name: "requests_total".into(),
+            target_labels: Default::default(),
             labels: vec![("__name__".into(), "spoofed_name".into())],
             value: 1.0,
             timestamp: 42,
-            help: String::new(),
+            help: Default::default(),
             metric_type: MetricType::Counter,
         };
-        let encoded = encode(None, &[metric], &BTreeMap::new(), false).unwrap();
+        let encoded = encode(None, vec![metric], &BTreeMap::new(), false).unwrap();
         let request = WriteRequest::decode(encoded.bytes.as_slice()).unwrap();
         let name_labels = request.timeseries[0]
             .labels
@@ -1478,13 +1613,14 @@ request_total{job="scrape",path="a\\b\"c\n",code="200"} 3.5 1700000000123
     fn encoder_emits_one_metadata_record_per_metric_family() {
         let metrics = [1.0, 2.0].map(|value| CollectedMetric {
             name: "queue_depth".into(),
+            target_labels: Default::default(),
             labels: vec![("worker".into(), value.to_string())],
             value,
             timestamp: 42,
             help: "Queued work.".into(),
             metric_type: MetricType::Gauge,
         });
-        let encoded = encode(None, &metrics, &BTreeMap::new(), false).unwrap();
+        let encoded = encode(None, metrics.to_vec(), &BTreeMap::new(), false).unwrap();
         let request = WriteRequest::decode(encoded.bytes.as_slice()).unwrap();
         assert_eq!(request.timeseries.len(), 2);
         assert_eq!(request.metadata.len(), 1);
@@ -1493,7 +1629,9 @@ request_total{job="scrape",path="a\\b\"c\n",code="200"} 3.5 1700000000123
 
     #[test]
     fn self_metrics_require_a_snapshot() {
-        let error = encode(None, &[], &BTreeMap::new(), true).err().unwrap();
+        let error = encode(None, Vec::new(), &BTreeMap::new(), true)
+            .err()
+            .unwrap();
         assert!(error.to_string().contains("require a status snapshot"));
     }
 
@@ -1501,13 +1639,14 @@ request_total{job="scrape",path="a\\b\"c\n",code="200"} 3.5 1700000000123
     fn snappy_round_trip_preserves_remote_write_payload() {
         let metric = CollectedMetric {
             name: "queue_depth".into(),
+            target_labels: Default::default(),
             labels: Vec::new(),
             value: 4.0,
             timestamp: 99,
-            help: String::new(),
+            help: Default::default(),
             metric_type: MetricType::Gauge,
         };
-        let encoded = encode(None, &[metric], &BTreeMap::new(), false).unwrap();
+        let encoded = encode(None, vec![metric], &BTreeMap::new(), false).unwrap();
         let compressed = snap::raw::Encoder::new()
             .compress_vec(&encoded.bytes)
             .unwrap();
@@ -1522,7 +1661,7 @@ request_total{job="scrape",path="a\\b\"c\n",code="200"} 3.5 1700000000123
     #[test]
     fn self_metrics_add_reserved_name_and_default_labels() {
         let snapshot = snapshot();
-        let encoded = encode(Some(&snapshot), &[], &BTreeMap::new(), true).unwrap();
+        let encoded = encode(Some(&snapshot), Vec::new(), &BTreeMap::new(), true).unwrap();
         let request = WriteRequest::decode(encoded.bytes.as_slice()).unwrap();
         let ready = request
             .timeseries
@@ -1552,10 +1691,11 @@ request_total{job="scrape",path="a\\b\"c\n",code="200"} 3.5 1700000000123
     fn extra_labels_apply_to_every_series_and_override_existing_values() {
         let metric = CollectedMetric {
             name: "http_requests_total".into(),
+            target_labels: Default::default(),
             labels: vec![("env".into(), "prod".into()), ("job".into(), "api".into())],
             value: 1.0,
             timestamp: 1700000000123,
-            help: String::new(),
+            help: Default::default(),
             metric_type: MetricType::Counter,
         };
         let extra_labels = BTreeMap::from([
@@ -1563,7 +1703,7 @@ request_total{job="scrape",path="a\\b\"c\n",code="200"} 3.5 1700000000123
             ("env".to_string(), "dev".to_string()),
         ]);
         let snapshot = snapshot();
-        let encoded = encode(Some(&snapshot), &[metric], &extra_labels, true).unwrap();
+        let encoded = encode(Some(&snapshot), vec![metric], &extra_labels, true).unwrap();
         let request = WriteRequest::decode(encoded.bytes.as_slice()).unwrap();
 
         assert!(!request.timeseries.is_empty());
