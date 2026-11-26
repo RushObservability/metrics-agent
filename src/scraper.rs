@@ -2055,10 +2055,11 @@ mod tests {
         let metrics = (0..20_001)
             .map(|index| CollectedMetric {
                 name: format!("metric_{index}"),
+                target_labels: Default::default(),
                 labels: Vec::new(),
                 value: index as f64,
                 timestamp: index,
-                help: String::new(),
+                help: Default::default(),
                 metric_type: MetricType::Gauge,
             })
             .collect();
@@ -2090,10 +2091,11 @@ mod tests {
         drop(receiver);
         let metric = CollectedMetric {
             name: "up".into(),
+            target_labels: Default::default(),
             labels: Vec::new(),
             value: 1.0,
             timestamp: 42,
-            help: String::new(),
+            help: Default::default(),
             metric_type: MetricType::Gauge,
         };
         let error = send_metric_chunks(&sender, vec![metric]).await.unwrap_err();
