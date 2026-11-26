@@ -604,14 +604,16 @@ impl BoundedTextParser {
             chunk.len(),
             self.limits.max_response_bytes,
         )?;
+        // Complete lines are drained below, so only the new bytes can hold a
+        // newline. Rescanning all of `pending` is quadratic for tiny chunks.
+        let start = self.pending.len();
         self.pending.extend_from_slice(chunk);
 
         let mut consumed = 0usize;
-        for newline in self
-            .pending
+        for newline in self.pending[start..]
             .iter()
             .enumerate()
-            .filter_map(|(index, byte)| (*byte == b'\n').then_some(index))
+            .filter_map(|(index, byte)| (*byte == b'\n').then_some(start + index))
         {
             let mut line = &self.pending[consumed..newline];
             if line.last() == Some(&b'\r') {
@@ -1641,6 +1643,48 @@ mod tests {
         assert_eq!(metrics[0].labels[0].1, "Montréal");
         assert_eq!(metrics[1].name, "pressure");
         assert_eq!(metrics[1].timestamp, 42);
+    }
+
+    #[test]
+    fn streaming_parser_handles_long_lines_fed_one_byte_at_a_time() {
+        let value = "v".repeat(4_000);
+        let body = format!(
+            "# {}\r\nlong{{label=\"{value}\"}} 7\r\nshort 8\n",
+            "x".repeat(60_000)
+        );
+        let mut parser = BoundedTextParser::new(&[], 42, ScrapeLimits::default()).unwrap();
+        for byte in body.as_bytes() {
+            parser.push_chunk(std::slice::from_ref(byte)).unwrap();
+        }
+
+        let metrics = parser.finish().unwrap();
+        assert_eq!(metrics.len(), 2);
+        assert_eq!(metrics[0].name, "long");
+        assert_eq!(metrics[0].labels[0].1, value);
+        assert_eq!(metrics[0].value, 7.0);
+        assert_eq!(metrics[1].name, "short");
+    }
+
+    #[test]
+    fn streaming_parser_scans_each_byte_once() {
+        // A full rescan per chunk costs about 4.5e10 byte checks here (minutes
+        // even in release builds); a linear scan finishes in milliseconds.
+        let limits = ScrapeLimits {
+            max_line_bytes: 300_000,
+            ..ScrapeLimits::default()
+        };
+        let line = format!("# {}\n", "x".repeat(299_000));
+        let mut parser = BoundedTextParser::new(&[], 42, limits).unwrap();
+        let started = std::time::Instant::now();
+        for byte in line.as_bytes() {
+            parser.push_chunk(std::slice::from_ref(byte)).unwrap();
+        }
+        assert!(parser.pending.is_empty());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "byte-at-a-time line took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
