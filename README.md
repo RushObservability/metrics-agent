@@ -296,6 +296,11 @@ operating-system allocation for that object.
 
 - The default ServiceAccount can read the resources used for discovery and
   patch supported VictoriaMetrics scrape resources. It cannot write Events.
+  On Kubernetes 1.30 and later the chart also installs a
+  ValidatingAdmissionPolicy that lets this ServiceAccount change only the
+  `operator.victoriametrics.com/ignore-prometheus-updates` annotation and
+  `ownerReferences` on those resources, so a leaked token cannot rewrite a
+  scrape spec. Set `rbac.admissionPolicy.enabled=false` to skip it.
 - Redirects are disabled. The resolver blocks loopback, link-local, cloud
   metadata, and Kubernetes API destinations, including DNS names that resolve
   to a blocked address. `METRICS_AGENT_SCRAPE_ALLOWED_DESTINATIONS` is the

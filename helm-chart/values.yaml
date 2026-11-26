@@ -59,6 +59,15 @@ serviceAccount:
 
 rbac:
   create: true
+  # The agent patches VictoriaMetrics scrape objects cluster-wide, but only to
+  # set the ignore-prometheus-updates annotation and ownerReferences. On
+  # Kubernetes 1.30+ this ValidatingAdmissionPolicy denies any other change made
+  # by the agent's ServiceAccount, so a leaked token cannot rewrite a scrape spec
+  # (for example to send a namespace's Secret to another host). It is skipped on
+  # clusters that do not serve admissionregistration.k8s.io/v1
+  # ValidatingAdmissionPolicy, and when precedence is disabled.
+  admissionPolicy:
+    enabled: true
 
 podAnnotations: {}
 podLabels: {}
