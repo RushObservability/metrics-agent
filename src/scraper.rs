@@ -299,7 +299,7 @@ async fn scrape_once_inner(
     let mut healthy = 0;
     let mut samples = 0;
     // Small targets share batches so each cycle costs few remote-write requests.
-    let mut chunk = Vec::with_capacity(METRIC_BATCH);
+    let mut chunk = PendingBatch::new(controller.config().scrape_max_retained_bytes);
     while let Some(result) = results.next().await {
         match result {
             Ok(Ok((index, metrics))) => {
@@ -337,8 +337,8 @@ async fn scrape_once_inner(
             Err(error) => warn!(%error, "scrape target task failed"),
         }
     }
-    if !chunk.is_empty() {
-        crate::queue_metrics::publish(sender, ScrapeMessage::Batch(chunk))
+    if !chunk.metrics.is_empty() {
+        crate::queue_metrics::publish(sender, ScrapeMessage::Batch(chunk.metrics))
             .await
             .context("metrics remote-write channel closed")?;
     }
@@ -672,20 +672,44 @@ fn account_response_bytes(total: &mut usize, chunk_bytes: usize, max_bytes: usiz
 
 const METRIC_BATCH: usize = 10_000;
 
+/// The cycle's pending remote-write batch. It is published at 10k samples or
+/// once it holds a target's worth of retained bytes, so a batch spanning many
+/// targets costs no more memory to encode than one target's scrape.
+struct PendingBatch {
+    metrics: Vec<CollectedMetric>,
+    bytes: usize,
+    max_bytes: usize,
+}
+
+impl PendingBatch {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            metrics: Vec::with_capacity(METRIC_BATCH),
+            bytes: 0,
+            max_bytes,
+        }
+    }
+}
+
 /// Appends metrics to the cycle's pending chunk and publishes every full one.
 /// The caller publishes the remainder before `Complete`.
 async fn send_metric_chunks(
     sender: &mpsc::Sender<ScrapeMessage>,
-    chunk: &mut Vec<CollectedMetric>,
+    chunk: &mut PendingBatch,
     metrics: Vec<CollectedMetric>,
 ) -> Result<u64> {
     let samples = metrics.len() as u64;
     for metric in metrics {
-        chunk.push(metric);
-        if chunk.len() == METRIC_BATCH {
+        chunk.bytes = chunk.bytes.saturating_add(metric.retained_bytes());
+        chunk.metrics.push(metric);
+        if chunk.metrics.len() == METRIC_BATCH || chunk.bytes >= chunk.max_bytes {
+            chunk.bytes = 0;
             crate::queue_metrics::publish(
                 sender,
-                ScrapeMessage::Batch(std::mem::replace(chunk, Vec::with_capacity(METRIC_BATCH))),
+                ScrapeMessage::Batch(std::mem::replace(
+                    &mut chunk.metrics,
+                    Vec::with_capacity(METRIC_BATCH),
+                )),
             )
             .await
             .context("metrics remote-write channel closed")?;
@@ -1290,10 +1314,11 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{
-        BoundedTextParser, DiscoveredTargets, DiscoveryData, ScrapeObject, ScrapeTarget,
-        TargetIdentity, account_response_bytes, destination_explicitly_allowed, index_namespaces,
-        namespace_allowed, pod_targets, probe_targets, send_metric_chunks, service_targets,
-        static_targets, targets_for_object, unsafe_destination_ip, validate_scrape_url,
+        BoundedTextParser, DiscoveredTargets, DiscoveryData, PendingBatch, ScrapeObject,
+        ScrapeTarget, TargetIdentity, account_response_bytes, destination_explicitly_allowed,
+        index_namespaces, namespace_allowed, pod_targets, probe_targets, send_metric_chunks,
+        service_targets, static_targets, targets_for_object, unsafe_destination_ip,
+        validate_scrape_url,
     };
     use crate::remote_write::{CollectedMetric, MetricType, ScrapeLimits};
     use crate::status::{MetricCardinality, StatusStore};
@@ -2094,7 +2119,7 @@ mod tests {
                 .collect()
         };
         let (sender, mut receiver) = mpsc::channel(4);
-        let mut chunk = Vec::new();
+        let mut chunk = PendingBatch::new(usize::MAX);
         let first = send_metric_chunks(&sender, &mut chunk, metrics(0..6_000)).await;
         let second = send_metric_chunks(&sender, &mut chunk, metrics(6_000..20_001)).await;
         assert_eq!((first.unwrap(), second.unwrap()), (6_000, 14_001));
@@ -2111,15 +2136,57 @@ mod tests {
             [10_000, 10_000]
         );
         assert_eq!(batches[1][0].name, "metric_10000");
-        assert_eq!(chunk.len(), 1);
-        assert_eq!(chunk[0].name, "metric_20000");
+        assert_eq!(chunk.metrics.len(), 1);
+        assert_eq!(chunk.metrics[0].name, "metric_20000");
+    }
+
+    #[tokio::test]
+    async fn batches_spanning_targets_stay_within_one_target_budget() {
+        // 300 targets, each 32 samples carrying 64 static labels of 4 KiB: every
+        // target fits the default 8 MiB budget, but together they would put
+        // about 2.5 GB of labels in one 10k-sample batch.
+        let budget = 8 * 1024 * 1024;
+        let big = (0..64)
+            .map(|index| (format!("label_{index}"), "x".repeat(4096)))
+            .collect::<Vec<_>>();
+        let (sender, mut receiver) = mpsc::channel(1_000);
+        let mut chunk = PendingBatch::new(budget);
+        for target in 0..300 {
+            let target_labels: Arc<[(String, String)]> = big.clone().into();
+            let metrics = (0..32)
+                .map(|index| CollectedMetric {
+                    name: format!("t{target}_m{index}"),
+                    target_labels: Arc::clone(&target_labels),
+                    labels: Vec::new(),
+                    value: 1.0,
+                    timestamp: 0,
+                    help: Default::default(),
+                    metric_type: MetricType::Gauge,
+                })
+                .collect();
+            send_metric_chunks(&sender, &mut chunk, metrics)
+                .await
+                .unwrap();
+        }
+        drop(sender);
+        let mut batches = 0;
+        while let Some(message) = receiver.recv().await {
+            let crate::remote_write::ScrapeMessage::Batch(metrics) = message else {
+                panic!("unexpected scrape message");
+            };
+            let bytes: usize = metrics.iter().map(CollectedMetric::retained_bytes).sum();
+            // At most one sample past the budget.
+            assert!(bytes < budget + metrics[0].retained_bytes());
+            batches += 1;
+        }
+        assert!(batches > 1);
     }
 
     #[tokio::test]
     async fn empty_metric_batch_sends_nothing() {
         let (sender, mut receiver) = mpsc::channel(1);
         assert_eq!(
-            send_metric_chunks(&sender, &mut Vec::new(), Vec::new())
+            send_metric_chunks(&sender, &mut PendingBatch::new(usize::MAX), Vec::new())
                 .await
                 .unwrap(),
             0
@@ -2141,9 +2208,13 @@ mod tests {
             help: Default::default(),
             metric_type: MetricType::Gauge,
         };
-        let error = send_metric_chunks(&sender, &mut Vec::new(), vec![metric; 10_000])
-            .await
-            .unwrap_err();
+        let error = send_metric_chunks(
+            &sender,
+            &mut PendingBatch::new(usize::MAX),
+            vec![metric; 10_000],
+        )
+        .await
+        .unwrap_err();
         assert!(error.to_string().contains("channel closed"));
     }
 

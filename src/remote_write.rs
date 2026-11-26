@@ -62,6 +62,14 @@ pub enum MetricType {
     Gauge = 2,
 }
 
+/// Bytes a label list costs in the retained-byte budget.
+pub(crate) fn label_bytes(labels: &[(String, String)]) -> usize {
+    labels
+        .iter()
+        .map(|(name, value)| name.len() + value.len() + std::mem::size_of::<(String, String)>())
+        .sum()
+}
+
 /// A metric sample collected from a Kubernetes scrape target.
 #[derive(Clone, Debug)]
 pub struct CollectedMetric {
@@ -76,6 +84,17 @@ pub struct CollectedMetric {
     /// Shared by every sample of the metric family.
     pub help: Arc<str>,
     pub metric_type: MetricType,
+}
+
+impl CollectedMetric {
+    /// What this sample costs in the retained-byte budget. The parser charges
+    /// the same amount per sample.
+    pub fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<CollectedMetric>()
+            + label_bytes(&self.target_labels)
+            + self.name.len()
+            + label_bytes(&self.labels)
+    }
 }
 
 #[cfg(test)]
@@ -514,10 +533,7 @@ impl PrometheusTextParser {
         limits: ScrapeLimits,
     ) -> Result<Self> {
         validate_target_labels(target_labels, limits)?;
-        let target_label_bytes = target_labels
-            .iter()
-            .map(|(name, value)| name.len() + value.len() + std::mem::size_of::<(String, String)>())
-            .sum::<usize>();
+        let target_label_bytes = label_bytes(target_labels);
         if target_label_bytes > limits.max_retained_bytes {
             return Err(crate::scrape_metrics::ResourceLimit(
                 "decoded scrape exceeds the configured retained-byte limit",
@@ -639,12 +655,7 @@ impl PrometheusTextParser {
         let sample_bytes = std::mem::size_of::<CollectedMetric>()
             + self.target_label_bytes
             + name.len()
-            + labels
-                .iter()
-                .map(|(name, value)| {
-                    name.len() + value.len() + std::mem::size_of::<(String, String)>()
-                })
-                .sum::<usize>();
+            + label_bytes(&labels);
         self.charge_retained(sample_bytes)?;
         self.samples.push(CollectedMetric {
             name: name.to_string(),
