@@ -32,9 +32,17 @@ equivalents. It marks native VictoriaMetrics objects so the operator's
 Prometheus converter does not overwrite them.
 
 **Discovers and scrapes targets.** Services, Endpoints, and Pods are resolved
-into HTTP targets. Scrapes run with fixed limits for concurrency, response
+into HTTP targets. They are listed once, when a monitor first needs them, and
+then kept current by watches that hold only names, labels, ports, and IPs. Scrapes run with fixed limits for concurrency, response
 bytes, line length, labels, and samples. One bad exporter fails its own scrape;
 it does not consume an unbounded amount of agent memory.
+
+Target labels (`job`, `namespace`, `service` or `pod`, `instance`) win over
+labels the exporter returns, like Prometheus `honor_labels: false`. A clashing
+exporter label is kept as `exported_<name>`. `ScrapeConfig` and `Probe` targets
+always carry the namespace of their CRD object; static labels cannot set
+`namespace`, and a static config with an invalid or `__`-prefixed label name is
+skipped with a warning.
 
 **Writes directly to Rush.** Workload samples and the agent's own health
 metrics are sent to query-api in Snappy-compressed remote-write requests. The
@@ -294,6 +302,13 @@ operating-system allocation for that object.
   explicit escape hatch.
 - A target that exceeds a response, line, label, metric-name, or sample limit
   fails before the agent publishes a partial payload.
+- SRE metrics collection sends the `x-rush-internal-token` header on every
+  request. sre-agent serves plain HTTP, so with `sreMetrics.discovery` the token
+  crosses the Pod network unencrypted to each Pod IP. Use discovery only on an
+  encrypted CNI or service mesh, or turn discovery off and point
+  `sreMetrics.url` at an https endpoint, such as a TLS-terminating proxy in
+  front of sre-agent. The agent logs a warning at startup when the token will be
+  sent over plain HTTP.
 - The published container runs as UID `65532` with a read-only filesystem,
   dropped capabilities, disabled privilege escalation, and RuntimeDefault
   seccomp.

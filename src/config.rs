@@ -390,13 +390,7 @@ pub fn configure_logging(level: &str) {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        env,
-        net::SocketAddr,
-        path::PathBuf,
-        sync::{Mutex, OnceLock},
-        time::Duration,
-    };
+    use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
 
     use clap::Parser;
 
@@ -404,14 +398,8 @@ mod tests {
         Config, parse_duration, parse_extra_labels, parse_listen_address, parse_positive_usize,
     };
 
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
-
     #[test]
     fn parses_colon_port_addresses() {
-        let _lock = env_lock().lock().unwrap();
         assert_eq!(
             parse_listen_address(":8080").unwrap().to_string(),
             "0.0.0.0:8080"
@@ -424,7 +412,6 @@ mod tests {
 
     #[test]
     fn parses_ipv6_and_rejects_invalid_listen_addresses() {
-        let _lock = env_lock().lock().unwrap();
         assert_eq!(
             parse_listen_address("[::1]:7070").unwrap(),
             SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 7070))
@@ -437,7 +424,6 @@ mod tests {
 
     #[test]
     fn parses_duration_precision_zero_and_invalid_values() {
-        let _lock = env_lock().lock().unwrap();
         assert_eq!(parse_duration("1.5s").unwrap(), Duration::from_millis(1500));
         assert_eq!(parse_duration("0s").unwrap(), Duration::ZERO);
         assert_eq!(parse_duration("0").unwrap(), Duration::ZERO);
@@ -457,7 +443,6 @@ mod tests {
 
     #[test]
     fn cli_parsing_covers_overrides_booleans_and_optional_secrets() {
-        let _lock = env_lock().lock().unwrap();
         let config = Config::try_parse_from([
             "metrics-agent",
             "--http-address",
@@ -580,7 +565,6 @@ mod tests {
 
     #[test]
     fn defaults_are_stable_and_invalid_cli_values_fail() {
-        let _lock = env_lock().lock().unwrap();
         let config = Config::try_parse_from(["metrics-agent"]).unwrap();
         assert_eq!(config.http_address, ":7070");
         assert_eq!(config.ui_address, ":7070");
@@ -628,44 +612,36 @@ mod tests {
         assert!(parse_positive_usize("-1").is_err());
     }
 
-    struct RestoredEnv {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl RestoredEnv {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = env::var_os(key);
-            // Environment mutation is process-global; this test only uses unique keys and restores them.
-            unsafe { env::set_var(key, value) };
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for RestoredEnv {
-        fn drop(&mut self) {
-            // Restore the caller's environment even if parsing panics.
-            unsafe {
-                match &self.previous {
-                    Some(value) => env::set_var(self.key, value),
-                    None => env::remove_var(self.key),
-                }
-            }
-        }
-    }
-
     #[test]
     fn environment_values_are_loaded_with_the_same_parsers_as_cli_values() {
-        let _lock = env_lock().lock().unwrap();
-        let _ui = RestoredEnv::set("METRICS_AGENT_UI_ENABLED", "false");
-        let _scrape_enabled = RestoredEnv::set("METRICS_AGENT_SCRAPE_ENABLED", "false");
-        let _scrape = RestoredEnv::set("METRICS_AGENT_SCRAPE_INTERVAL", "275ms");
-        let _remote_interval = RestoredEnv::set("RUSH_REMOTE_WRITE_INTERVAL", "2m");
-        let _url = RestoredEnv::set("RUSH_REMOTE_WRITE_URL", "http://rush.test/write");
-        let _extra_labels = RestoredEnv::set(
-            "METRICS_AGENT_EXTRA_LABELS",
-            r#"{"cluster":"ntt-japan","env":"dev"}"#,
-        );
+        // Process env is shared with every concurrently running test (clap reads it
+        // in each Config parse), so set these variables only in a child test process.
+        if env::var_os("METRICS_AGENT_CONFIG_ENV_TEST_CHILD").is_none() {
+            let child = std::process::Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "config::tests::environment_values_are_loaded_with_the_same_parsers_as_cli_values",
+                ])
+                .env("METRICS_AGENT_CONFIG_ENV_TEST_CHILD", "1")
+                .env("METRICS_AGENT_UI_ENABLED", "false")
+                .env("METRICS_AGENT_SCRAPE_ENABLED", "false")
+                .env("METRICS_AGENT_SCRAPE_INTERVAL", "275ms")
+                .env("RUSH_REMOTE_WRITE_INTERVAL", "2m")
+                .env("RUSH_REMOTE_WRITE_URL", "http://rush.test/write")
+                .env(
+                    "METRICS_AGENT_EXTRA_LABELS",
+                    r#"{"cluster":"ntt-japan","env":"dev"}"#,
+                )
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&child.stdout);
+            assert!(
+                child.status.success() && stdout.contains("1 passed"),
+                "{stdout}{}",
+                String::from_utf8_lossy(&child.stderr)
+            );
+            return;
+        }
 
         let config = Config::try_parse_from(["metrics-agent"]).unwrap();
         assert!(!config.ui_enabled);

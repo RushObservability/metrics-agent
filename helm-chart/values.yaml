@@ -139,6 +139,11 @@ selfMetrics:
   enabled: false
 
 # Authenticated SRE health collection, configured independently of CRD targets.
+# The token is sent in the x-rush-internal-token header. sre-agent serves plain
+# HTTP, so an http url sends it unencrypted. With discovery enabled the agent
+# scrapes each Pod IP directly, which needs an encrypted CNI or service mesh to
+# keep the token off the wire; otherwise leave discovery off and use an https url
+# (for example a TLS-terminating proxy in front of sre-agent).
 sreMetrics:
   enabled: false
   url: ""
