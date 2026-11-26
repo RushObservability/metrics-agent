@@ -293,6 +293,13 @@ operating-system allocation for that object.
   explicit escape hatch.
 - A target that exceeds a response, line, label, metric-name, or sample limit
   fails before the agent publishes a partial payload.
+- SRE metrics collection sends the `x-rush-internal-token` header on every
+  request. sre-agent serves plain HTTP, so with `sreMetrics.discovery` the token
+  crosses the Pod network unencrypted to each Pod IP. Use discovery only on an
+  encrypted CNI or service mesh, or turn discovery off and point
+  `sreMetrics.url` at an https endpoint, such as a TLS-terminating proxy in
+  front of sre-agent. The agent logs a warning at startup when the token will be
+  sent over plain HTTP.
 - The published container runs as UID `65532` with a read-only filesystem,
   dropped capabilities, disabled privilege escalation, and RuntimeDefault
   seccomp.

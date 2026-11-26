@@ -77,6 +77,11 @@ pub(super) fn target(config: &Config) -> Result<Option<ScrapeTarget>> {
             bail!("SRE metrics URL must address the configured Kubernetes Service");
         }
     }
+    if let Some(warning) = cleartext_token_warning(config, &url) {
+        // target() runs for every scrape; startup validation calls it first.
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| tracing::warn!("{warning}"));
+    }
     Ok(Some(ScrapeTarget {
         labels: vec![
             ("job".into(), "sre-agent".into()),
@@ -99,6 +104,22 @@ pub(super) fn target(config: &Config) -> Result<Option<ScrapeTarget>> {
             name: "sre-agent".into(),
         },
     }))
+}
+
+/// sre-agent serves plain HTTP, and Pod IP certificates rarely validate, so
+/// discovery usually sends the token unencrypted across the Pod network.
+fn cleartext_token_warning(config: &Config, url: &Url) -> Option<&'static str> {
+    if url.scheme() != "http" {
+        return None;
+    }
+    Some(if config.sre_metrics_service.is_some() {
+        "SRE metrics discovery sends x-rush-internal-token over plain HTTP to each sre-agent Pod IP; \
+         run it only on an encrypted CNI or service mesh, or disable discovery and use an https \
+         METRICS_AGENT_SRE_METRICS_URL"
+    } else {
+        "SRE metrics URL uses plain HTTP, so x-rush-internal-token crosses the network unencrypted; \
+         use an https URL or an encrypted CNI or service mesh"
+    })
 }
 
 fn valid_dns_label(value: &str) -> bool {
@@ -614,6 +635,24 @@ mod tests {
         slices[1].endpoints[0].addresses[0] = "10.2.0.1".into();
         pods[2].spec.as_mut().unwrap().host_network = Some(true);
         assert!(verified_targets(&config, &base, &service(), &slices, &pods).is_err());
+    }
+
+    #[test]
+    fn plain_http_token_transport_is_flagged() {
+        let file = TokenFile::new();
+        let discovery = service_config(&file);
+        let url = Url::parse(discovery.sre_metrics_url.as_deref().unwrap()).unwrap();
+        let warning = cleartext_token_warning(&discovery, &url).unwrap();
+        assert!(warning.contains("Pod IP") && warning.contains("encrypted CNI or service mesh"));
+        let single = file.config("http://sre-agent:8081/metrics");
+        assert!(
+            cleartext_token_warning(&single, &url)
+                .unwrap()
+                .contains("https URL")
+        );
+        let https = Url::parse("https://sre-agent.health.svc:8081/metrics").unwrap();
+        assert!(cleartext_token_warning(&discovery, &https).is_none());
+        assert!(cleartext_token_warning(&single, &https).is_none());
     }
 
     #[test]
