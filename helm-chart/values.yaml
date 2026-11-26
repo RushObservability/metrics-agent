@@ -141,7 +141,7 @@ sreMetrics:
   url: ""
   tokenSecret:
     name: ""
-    key: sre-agent-internal-token
+    key: sre-agent-metrics-token
   discovery:
     enabled: false
     serviceName: ""

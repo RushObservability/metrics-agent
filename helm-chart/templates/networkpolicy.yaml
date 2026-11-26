@@ -21,7 +21,10 @@ spec:
     {{- end }}
     {{- if and .Values.sreMetrics.enabled .Values.scrape.enabled }}
     - to:
-        - podSelector:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ default .Release.Namespace .Values.sreMetrics.discovery.namespace | quote }}
+          podSelector:
             matchLabels:
               app.kubernetes.io/component: sre-agent
               app.kubernetes.io/instance: {{ .Release.Name }}
