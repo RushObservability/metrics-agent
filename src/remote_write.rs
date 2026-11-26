@@ -904,10 +904,10 @@ async fn run_with_metrics(
                     ScrapeMessage::Complete { targets: _, healthy_targets: _, samples: _, error } => {
                         if let Some(error) = error {
                             cycle_error.get_or_insert_with(|| anyhow!(error));
-                        } else if let Some(url) = url.as_deref() {
+                        } else if let Some(url) = url.as_deref().filter(|_| !draining) {
                             // A scrape with no samples should still publish the
                             // agent's own health metrics.
-                            if !draining && cycle_active && !cycle_sent_self && cycle_error.is_none() {
+                            if cycle_active && !cycle_sent_self && cycle_error.is_none() {
                                 let snapshot = status.snapshot().await;
                                 match publish_inner(
                                     &client,
