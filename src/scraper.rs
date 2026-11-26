@@ -15,11 +15,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use futures_util::{StreamExt, stream};
 use jiff::{Timestamp, tz::Offset};
-use kube::{
-    Client,
-    api::{Api, ApiResource, DynamicObject, ListParams},
-    core::GroupVersionKind,
-};
+use kube::Client;
 use reqwest::Url;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use serde_json::Value;
@@ -33,6 +29,7 @@ use crate::{
     status::{MetricCardinality, ScrapeStatus},
 };
 
+mod discovery_watch;
 mod internal_target;
 mod selector;
 
@@ -63,12 +60,14 @@ struct DiscoveryData {
     endpoints: HashMap<(String, String), Value>,
     pods: BTreeMap<String, Vec<Value>>,
     allowed_target_namespaces: Vec<String>,
+    allowed_source_namespaces: Vec<String>,
 }
 
 #[derive(Default)]
 struct TargetCache {
     refreshed_at: Option<Instant>,
     targets: Arc<[ScrapeTarget]>,
+    watches: discovery_watch::DiscoveryWatches,
 }
 
 impl TargetCache {
@@ -96,6 +95,7 @@ impl TargetCache {
         let started = Instant::now();
         match discover_targets(
             client,
+            &mut self.watches,
             pairs,
             inventory,
             max_targets,
@@ -610,14 +610,16 @@ impl BoundedTextParser {
             chunk.len(),
             self.limits.max_response_bytes,
         )?;
+        // Complete lines are drained below, so only the new bytes can hold a
+        // newline. Rescanning all of `pending` is quadratic for tiny chunks.
+        let start = self.pending.len();
         self.pending.extend_from_slice(chunk);
 
         let mut consumed = 0usize;
-        for newline in self
-            .pending
+        for newline in self.pending[start..]
             .iter()
             .enumerate()
-            .filter_map(|(index, byte)| (*byte == b'\n').then_some(index))
+            .filter_map(|(index, byte)| (*byte == b'\n').then_some(start + index))
         {
             let mut line = &self.pending[consumed..newline];
             if line.last() == Some(&b'\r') {
@@ -688,6 +690,7 @@ async fn send_metric_chunks(
 
 async fn discover_targets(
     client: Client,
+    watches: &mut discovery_watch::DiscoveryWatches,
     pairs: &[ResourcePair],
     inventory: &ScrapeInventory,
     max_targets: usize,
@@ -695,9 +698,15 @@ async fn discover_targets(
 ) -> Result<Vec<ScrapeTarget>> {
     let selected = inventory.selected(pairs).await?;
     let needs = |kind| selected.iter().any(|(pair, _, _)| *pair == kind);
-    let mut data =
-        load_discovery_data(&client, needs("service-monitor"), needs("pod-monitor")).await?;
+    let mut data = load_discovery_data(
+        &client,
+        watches,
+        needs("service-monitor"),
+        needs("pod-monitor"),
+    )
+    .await?;
     data.allowed_target_namespaces = allowed_target_namespaces.to_vec();
+    data.allowed_source_namespaces = inventory.allowed_namespaces().to_vec();
     let mut targets = DiscoveredTargets::new(max_targets);
     for (pair, source, object) in selected {
         targets_for_object(pair, source, &object, &data, &mut targets)?;
@@ -707,13 +716,15 @@ async fn discover_targets(
 
 async fn load_discovery_data(
     client: &Client,
+    watches: &mut discovery_watch::DiscoveryWatches,
     services_needed: bool,
     pods_needed: bool,
 ) -> Result<DiscoveryData> {
+    let wait = watches.sync_wait;
     let (services, endpoints, pods) = tokio::try_join!(
-        list_core(client, "Service", "services", services_needed),
-        list_core(client, "Endpoints", "endpoints", services_needed),
-        list_core(client, "Pod", "pods", pods_needed),
+        watches.services.objects(client, services_needed, wait),
+        watches.endpoints.objects(client, services_needed, wait),
+        watches.pods.objects(client, pods_needed, wait),
     )?;
     Ok(DiscoveryData {
         services: index_namespaces(services),
@@ -723,6 +734,7 @@ async fn load_discovery_data(
             .collect(),
         pods: index_namespaces(pods),
         allowed_target_namespaces: Vec::new(),
+        allowed_source_namespaces: Vec::new(),
     })
 }
 
@@ -749,54 +761,6 @@ fn objects_in_namespaces<'a>(
         .flatten()
         .filter_map(|namespace| index.get(namespace));
     all.chain(selected).flatten()
-}
-
-async fn list_core(client: &Client, kind: &str, plural: &str, needed: bool) -> Result<Vec<Value>> {
-    let mut objects = Vec::new();
-    if !needed {
-        return Ok(objects);
-    }
-    let mut resource = ApiResource::from_gvk(&GroupVersionKind::gvk("", "v1", kind));
-    resource.plural = plural.to_string();
-    let api = Api::<DynamicObject>::all_with(client.clone(), &resource);
-    let mut params = ListParams::default().limit(500);
-    loop {
-        let page = api
-            .list(&params)
-            .await
-            .with_context(|| format!("list Kubernetes {kind} objects"))?;
-        objects.extend(page.items.into_iter().map(|object| {
-            let mut fields = object.data;
-            match kind {
-                "Service" => {
-                    let ports = fields.pointer_mut("/spec/ports").map(Value::take);
-                    fields = serde_json::json!({ "spec": { "ports": ports } });
-                }
-                "Pod" => {
-                    let containers = fields.pointer_mut("/spec/containers").and_then(Value::as_array_mut);
-                    let ports: Vec<_> = containers.into_iter().flatten()
-                        .map(|container| serde_json::json!({ "ports": container.get_mut("ports").map(Value::take) }))
-                        .collect();
-                    let ip = fields.pointer_mut("/status/podIP").map(Value::take);
-                    fields = serde_json::json!({ "spec": { "containers": ports }, "status": { "podIP": ip } });
-                }
-                _ => {
-                    let subsets = fields.get_mut("subsets").map(Value::take);
-                    fields = serde_json::json!({ "subsets": subsets });
-                }
-            }
-            fields["metadata"] = serde_json::json!({
-                "namespace": object.metadata.namespace,
-                "name": object.metadata.name,
-                "labels": object.metadata.labels,
-            });
-            fields
-        }));
-        let Some(token) = page.metadata.continue_.filter(|token| !token.is_empty()) else {
-            return Ok(objects);
-        };
-        params.continue_token = Some(token);
-    }
 }
 
 struct DiscoveredTargets {
@@ -843,6 +807,16 @@ fn targets_for_object(
         name: object.name.clone(),
     };
     let spec = &object.spec;
+    if matches!(pair, "probe" | "scrape-config") && !arbitrary_hosts_allowed(object, data) {
+        warn!(
+            source = identity.source,
+            kind = identity.pair,
+            namespace = identity.namespace,
+            name = identity.name,
+            "skipping scrape object that can name any host; list its namespace in the allowed scrape namespaces or allow all target namespaces"
+        );
+        return Ok(());
+    }
     match pair {
         "service-monitor" => service_targets(spec, &identity, data, targets),
         "pod-monitor" => pod_targets(spec, &identity, data, targets),
@@ -850,6 +824,19 @@ fn targets_for_object(
         "scrape-config" => static_targets(spec, &identity, targets),
         _ => Ok(()),
     }
+}
+
+/// Probe and ScrapeConfig objects name hosts directly, so the per-namespace
+/// target restriction cannot apply to them. While that restriction is on, only
+/// namespaces the operator listed explicitly may define them.
+fn arbitrary_hosts_allowed(object: &ScrapeObject, data: &DiscoveryData) -> bool {
+    data.allowed_target_namespaces
+        .iter()
+        .any(|name| name.trim() == "*")
+        || data
+            .allowed_source_namespaces
+            .iter()
+            .any(|name| name.trim() == object.namespace)
 }
 
 fn monitor_selection(
@@ -914,9 +901,12 @@ fn service_targets(
                 if endpoint_namespace.is_some_and(|namespace| namespace != service_namespace) {
                     continue;
                 }
-                let instance = format!("{ip}:{port}");
+                let instance = host_port(ip, port);
+                let Some(url) = endpoint_url(scheme, ip, port, path, identity) else {
+                    continue;
+                };
                 targets.push(ScrapeTarget {
-                    url: build_url(scheme, &instance, path),
+                    url,
                     labels: vec![
                         ("job".into(), identity.name.clone()),
                         ("namespace".into(), service_namespace.clone()),
@@ -970,9 +960,12 @@ fn pod_targets(
                 .get("scheme")
                 .and_then(Value::as_str)
                 .unwrap_or("http");
-            let instance = format!("{ip}:{port}");
+            let instance = host_port(ip, port);
+            let Some(url) = endpoint_url(scheme, ip, port, path, identity) else {
+                continue;
+            };
             targets.push(ScrapeTarget {
-                url: build_url(scheme, &instance, path),
+                url,
                 labels: vec![
                     ("job".into(), identity.name.clone()),
                     ("namespace".into(), pod_namespace.clone()),
@@ -1004,13 +997,20 @@ fn static_targets(
         .and_then(Value::as_str)
         .unwrap_or("/metrics");
     for config in configs {
-        let labels = config
+        let mut labels = config
             .get("labels")
             .and_then(Value::as_object)
             .into_iter()
             .flatten()
             .map(|(key, value)| (key.clone(), value.as_str().unwrap_or_default().to_string()))
             .collect::<Vec<_>>();
+        if let Some((invalid, _)) = labels.iter().find(|(key, _)| !valid_static_label_name(key)) {
+            warn!(source = identity.source, kind = identity.pair, namespace = identity.namespace, name = identity.name, label = %invalid, "skipping static scrape config with an invalid label name");
+            continue;
+        }
+        // The CRD's own namespace always wins so a static label cannot claim
+        // another tenant's namespace.
+        labels.retain(|(key, _)| key != "namespace");
         for target in config
             .get("targets")
             .and_then(Value::as_array)
@@ -1025,6 +1025,7 @@ fn static_targets(
             if !target_labels.iter().any(|(key, _)| key == "instance") {
                 target_labels.push(("instance".into(), target.to_string()));
             }
+            target_labels.push(("namespace".into(), identity.namespace.clone()));
             targets.push(ScrapeTarget {
                 url: normalize_target(target, scheme, path),
                 labels: target_labels,
@@ -1033,6 +1034,16 @@ fn static_targets(
         }
     }
     Ok(())
+}
+
+/// Prometheus label names, excluding the reserved `__` prefix.
+fn valid_static_label_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+        && !name.starts_with("__")
 }
 
 fn probe_targets(
@@ -1062,6 +1073,7 @@ fn probe_targets(
             labels: vec![
                 ("job".into(), identity.name.clone()),
                 ("instance".into(), target.into()),
+                ("namespace".into(), identity.namespace.clone()),
             ],
             identity: identity.clone(),
         })?;
@@ -1174,6 +1186,15 @@ fn pod_port(pod: &Value, requested: Option<&Value>) -> Option<u16> {
         })
 }
 
+/// `ip:port` as Prometheus writes it: IPv6 is bracketed so the URL and the
+/// `instance` label parse.
+fn host_port(ip: &str, port: u16) -> String {
+    match ip.parse::<IpAddr>() {
+        Ok(ip) => std::net::SocketAddr::new(ip, port).to_string(),
+        Err(_) => format!("{ip}:{port}"),
+    }
+}
+
 fn build_url(scheme: &str, host: &str, path: &str) -> String {
     format!(
         "{scheme}://{host}{}",
@@ -1183,6 +1204,42 @@ fn build_url(scheme: &str, host: &str, path: &str) -> String {
             format!("/{path}")
         }
     )
+}
+/// Builds a ServiceMonitor or PodMonitor URL that can only reach the
+/// discovered endpoint, whatever the monitor's scheme and path contain.
+fn endpoint_url(
+    scheme: &str,
+    ip: &str,
+    port: u16,
+    path: &str,
+    identity: &TargetIdentity,
+) -> Option<String> {
+    let scheme = scheme.to_ascii_lowercase();
+    let url = matches!(scheme.as_str(), "http" | "https")
+        .then(|| build_url(&scheme, &host_port(ip, port), path));
+    let points_at_endpoint = url
+        .as_deref()
+        .and_then(|url| Url::parse(url).ok())
+        .is_some_and(|url| {
+            url.host_str()
+                .zip(url.port_or_known_default())
+                .is_some_and(|(host, url_port)| {
+                    host_port(host.trim_matches(['[', ']']), url_port) == host_port(ip, port)
+                })
+        });
+    if !points_at_endpoint {
+        warn!(
+            source = identity.source,
+            kind = identity.pair,
+            namespace = identity.namespace,
+            name = identity.name,
+            scheme,
+            path,
+            "skipping Kubernetes scrape endpoint whose scheme or path does not address the discovered endpoint"
+        );
+        return None;
+    }
+    url
 }
 fn normalize_target(target: &str, scheme: &str, path: &str) -> String {
     if target.starts_with("http://") || target.starts_with("https://") {
@@ -1385,6 +1442,7 @@ mod tests {
     fn discovery_data() -> DiscoveryData {
         DiscoveryData {
             allowed_target_namespaces: vec!["default".into()],
+            allowed_source_namespaces: Vec::new(),
             services: index_namespaces(vec![json!({
                 "metadata": {
                     "name": "api",
@@ -1453,6 +1511,111 @@ mod tests {
                 .labels
                 .contains(&("instance".into(), "10.0.0.1:9100".into()))
         );
+    }
+
+    fn discovery_data_at(ip: &str, port: u16) -> DiscoveryData {
+        let mut data = discovery_data();
+        let endpoints = data
+            .endpoints
+            .get_mut(&("default".into(), "api".into()))
+            .unwrap();
+        endpoints["subsets"][0]["addresses"][0]["ip"] = json!(ip);
+        endpoints["subsets"][0]["ports"][0]["port"] = json!(port);
+        let pod = &mut data.pods.get_mut("default").unwrap()[0];
+        pod["status"]["podIP"] = json!(ip);
+        pod["spec"]["containers"][0]["ports"][0]["containerPort"] = json!(port);
+        data
+    }
+
+    /// One ServiceMonitor target and one PodMonitor target, expanded separately
+    /// because both point at the same address and would be deduplicated.
+    fn endpoint_and_pod_targets(data: &DiscoveryData) -> Vec<ScrapeTarget> {
+        let spec = json!({
+            "selector": {"matchLabels": {"app": "api"}},
+            "namespaceSelector": {"matchNames": ["default"]},
+            "endpoints": [{"port": "metrics"}]
+        });
+        let mut service = DiscoveredTargets::new(1);
+        service_targets(
+            &spec,
+            &identity("service-monitor", "prometheus"),
+            data,
+            &mut service,
+        )
+        .unwrap();
+        let mut pod = DiscoveredTargets::new(1);
+        pod_targets(
+            &spec,
+            &identity("pod-monitor", "prometheus"),
+            data,
+            &mut pod,
+        )
+        .unwrap();
+        let targets = [service.items, pod.items].concat();
+        assert_eq!(targets.len(), 2);
+        targets
+    }
+
+    #[tokio::test]
+    async fn ipv6_endpoints_and_pods_are_bracketed_and_scrapeable() {
+        use clap::Parser;
+        for target in endpoint_and_pod_targets(&discovery_data_at("fd00::1", 8080)) {
+            assert_eq!(target.url, "http://[fd00::1]:8080/metrics");
+            assert!(
+                target
+                    .labels
+                    .contains(&("instance".into(), "[fd00::1]:8080".into()))
+            );
+            assert!(validate_scrape_url(&target.url, &[]).is_ok());
+        }
+
+        let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route("/metrics", axum::routing::get(|| async { "up 1\n" })),
+            )
+            .await
+            .unwrap();
+        });
+        let mut config = crate::config::Config::parse_from(["test"]);
+        config.scrape_allowed_destinations = vec!["::1".into()];
+        let http =
+            super::scrape_client(std::time::Duration::from_secs(2), vec!["::1".into()]).unwrap();
+        for target in endpoint_and_pod_targets(&discovery_data_at("::1", port)) {
+            assert_eq!(target.url, format!("http://[::1]:{port}/metrics"));
+            let samples = super::fetch_target(&http, &target, &config, ScrapeLimits::default())
+                .await
+                .unwrap();
+            assert_eq!(samples[0].name, "up");
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn bracketed_ipv6_targets_still_hit_the_destination_policy() {
+        use clap::Parser;
+        let config = crate::config::Config::parse_from(["test"]);
+        let http = super::scrape_client(std::time::Duration::from_secs(1), vec![]).unwrap();
+        for ip in ["fd00:ec2::254", "fe80::1", "::1", "::ffff:169.254.169.254"] {
+            for target in endpoint_and_pod_targets(&discovery_data_at(ip, 8080)) {
+                assert_eq!(target.url, format!("http://[{ip}]:8080/metrics"));
+                assert!(validate_scrape_url(&target.url, &[]).is_err(), "{ip}");
+                let error = super::fetch_target(&http, &target, &config, ScrapeLimits::default())
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(
+                        error.downcast_ref::<crate::scrape_metrics::Failure>(),
+                        Some(crate::scrape_metrics::Failure(
+                            crate::scrape_metrics::Outcome::PolicyDenied
+                        ))
+                    ),
+                    "{ip}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1540,6 +1703,33 @@ mod tests {
                 .labels
                 .contains(&("instance".into(), "https://example.com/a?x=1".into()))
         );
+        assert!(
+            targets[0]
+                .labels
+                .contains(&("namespace".into(), "monitoring".into()))
+        );
+    }
+
+    #[test]
+    fn static_labels_cannot_spoof_namespace_or_use_invalid_names() {
+        let spec = json!({
+            "staticConfigs": [
+                {"targets": ["node-a:9100"], "labels": {"namespace": "payments", "team": "a"}},
+                {"targets": ["node-b:9100"], "labels": {"__address__": "x"}},
+                {"targets": ["node-c:9100"], "labels": {"bad-name": "x"}}
+            ]
+        });
+        let mut targets = DiscoveredTargets::new(3);
+        static_targets(&spec, &identity("scrape-config", "victoria"), &mut targets).unwrap();
+        let targets = targets.items;
+        assert_eq!(targets.len(), 1);
+        let namespaces = targets[0]
+            .labels
+            .iter()
+            .filter(|(key, _)| key == "namespace")
+            .collect::<Vec<_>>();
+        assert_eq!(namespaces, [&("namespace".into(), "monitoring".into())]);
+        assert!(targets[0].labels.contains(&("team".into(), "a".into())));
     }
 
     #[test]
@@ -1599,6 +1789,137 @@ mod tests {
     }
 
     #[test]
+    fn monitor_scheme_and_path_cannot_redirect_to_another_host() {
+        type Expand = fn(
+            &serde_json::Value,
+            &TargetIdentity,
+            &DiscoveryData,
+            &mut DiscoveredTargets,
+        ) -> anyhow::Result<()>;
+        let monitors: [(&str, &str, &str, Expand); 2] = [
+            (
+                "service-monitor",
+                "endpoints",
+                "10.0.0.1:9100",
+                service_targets,
+            ),
+            (
+                "pod-monitor",
+                "podMetricsEndpoints",
+                "10.0.0.2:8080",
+                pod_targets,
+            ),
+        ];
+        for (kind, field, endpoint_address, expand) in monitors {
+            let discover = |scheme: &str, path: &str| {
+                let spec = json!({
+                    "selector": {"matchLabels": {"app": "api"}},
+                    "namespaceSelector": {"matchNames": ["default"]},
+                    field: [{"port": "metrics", "scheme": scheme, "path": path}]
+                });
+                let mut targets = DiscoveredTargets::new(2);
+                expand(
+                    &spec,
+                    &identity(kind, "prometheus"),
+                    &discovery_data(),
+                    &mut targets,
+                )
+                .unwrap();
+                targets.items
+            };
+            for scheme in [
+                "http://10.4.2.9:9100/metrics?x=",
+                "http://10.4.2.9:9100/metrics#",
+                "https://10.4.2.9:9100",
+                "file",
+                "",
+            ] {
+                assert!(discover(scheme, "/metrics").is_empty(), "{kind} {scheme:?}");
+            }
+            for (scheme, expected) in [("http", "http"), ("HTTPS", "https")] {
+                let targets = discover(scheme, "/metrics");
+                assert_eq!(targets.len(), 1, "{kind} {scheme}");
+                assert_eq!(
+                    targets[0].url,
+                    format!("{expected}://{endpoint_address}/metrics")
+                );
+            }
+            // The path is always rooted after the endpoint, so it cannot change the authority.
+            for path in [
+                "@10.4.2.9:9100/metrics",
+                "//10.4.2.9:9100/metrics",
+                "\\\\10.4.2.9:9100/metrics",
+                ":81/metrics",
+            ] {
+                for target in discover("http", path) {
+                    let url = reqwest::Url::parse(&target.url).unwrap();
+                    assert_eq!(
+                        format!("{}:{}", url.host_str().unwrap(), url.port().unwrap()),
+                        endpoint_address,
+                        "{kind} {path:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn endpoint_url_requires_the_url_to_address_the_endpoint() {
+        let identity = identity("service-monitor", "prometheus");
+        assert_eq!(
+            super::endpoint_url("http", "10.0.0.1", 80, "metrics", &identity).as_deref(),
+            Some("http://10.0.0.1:80/metrics")
+        );
+        assert!(super::endpoint_url("http", "evil.example/x?", 80, "/", &identity).is_none());
+        assert!(super::endpoint_url("http", "10.0.0.1:81/x?", 80, "/", &identity).is_none());
+    }
+
+    #[test]
+    fn host_naming_objects_need_an_explicitly_allowed_namespace() {
+        let probe = ScrapeObject {
+            namespace: "monitoring".into(),
+            name: "probe".into(),
+            spec: json!({
+                "prober": {"url": "http://blackbox:9115/probe"},
+                "targets": {"staticConfig": {"static": ["10.4.2.9:9100"]}}
+            }),
+        };
+        let scrape_config = ScrapeObject {
+            namespace: "monitoring".into(),
+            name: "static".into(),
+            spec: json!({"staticConfigs": [{"targets": ["10.4.2.9:9100"]}]}),
+        };
+        let discovered = |data: &DiscoveryData| {
+            let mut targets = DiscoveredTargets::new(4);
+            targets_for_object("probe", "prometheus", &probe, data, &mut targets).unwrap();
+            targets_for_object(
+                "scrape-config",
+                "victoria",
+                &scrape_config,
+                data,
+                &mut targets,
+            )
+            .unwrap();
+            targets.items.len()
+        };
+
+        let mut data = discovery_data();
+        // Restriction on, source namespaces unrestricted or not listing it.
+        data.allowed_target_namespaces.clear();
+        assert_eq!(discovered(&data), 0);
+        data.allowed_target_namespaces = vec!["default".into()];
+        data.allowed_source_namespaces = vec!["apps".into()];
+        assert_eq!(discovered(&data), 0);
+        // Restriction on, namespace listed explicitly.
+        data.allowed_source_namespaces = vec!["apps".into(), " monitoring ".into()];
+        assert_eq!(discovered(&data), 2);
+        // Restriction off.
+        data.allowed_source_namespaces.clear();
+        data.allowed_target_namespaces = vec!["*".into()];
+        assert_eq!(discovered(&data), 2);
+    }
+
+    #[test]
     fn deduplicates_by_scrape_url_and_keeps_first_target() {
         let first = ScrapeTarget {
             url: "http://10.0.0.1:9100/metrics".into(),
@@ -1650,6 +1971,48 @@ mod tests {
     }
 
     #[test]
+    fn streaming_parser_handles_long_lines_fed_one_byte_at_a_time() {
+        let value = "v".repeat(4_000);
+        let body = format!(
+            "# {}\r\nlong{{label=\"{value}\"}} 7\r\nshort 8\n",
+            "x".repeat(60_000)
+        );
+        let mut parser = BoundedTextParser::new(&[], 42, ScrapeLimits::default()).unwrap();
+        for byte in body.as_bytes() {
+            parser.push_chunk(std::slice::from_ref(byte)).unwrap();
+        }
+
+        let metrics = parser.finish().unwrap();
+        assert_eq!(metrics.len(), 2);
+        assert_eq!(metrics[0].name, "long");
+        assert_eq!(metrics[0].labels[0].1, value);
+        assert_eq!(metrics[0].value, 7.0);
+        assert_eq!(metrics[1].name, "short");
+    }
+
+    #[test]
+    fn streaming_parser_scans_each_byte_once() {
+        // A full rescan per chunk costs about 4.5e10 byte checks here (minutes
+        // even in release builds); a linear scan finishes in milliseconds.
+        let limits = ScrapeLimits {
+            max_line_bytes: 300_000,
+            ..ScrapeLimits::default()
+        };
+        let line = format!("# {}\n", "x".repeat(299_000));
+        let mut parser = BoundedTextParser::new(&[], 42, limits).unwrap();
+        let started = std::time::Instant::now();
+        for byte in line.as_bytes() {
+            parser.push_chunk(std::slice::from_ref(byte)).unwrap();
+        }
+        assert!(parser.pending.is_empty());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "byte-at-a-time line took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
     fn streaming_parser_enforces_cumulative_body_limit() {
         let limits = ScrapeLimits {
             max_response_bytes: 8,
@@ -1698,10 +2061,11 @@ mod tests {
         let metrics = (0..20_001)
             .map(|index| CollectedMetric {
                 name: format!("metric_{index}"),
+                target_labels: Default::default(),
                 labels: Vec::new(),
                 value: index as f64,
                 timestamp: index,
-                help: String::new(),
+                help: Default::default(),
                 metric_type: MetricType::Gauge,
             })
             .collect();
@@ -1733,10 +2097,11 @@ mod tests {
         drop(receiver);
         let metric = CollectedMetric {
             name: "up".into(),
+            target_labels: Default::default(),
             labels: Vec::new(),
             value: 1.0,
             timestamp: 42,
-            help: String::new(),
+            help: Default::default(),
             metric_type: MetricType::Gauge,
         };
         let error = send_metric_chunks(&sender, vec![metric]).await.unwrap_err();
@@ -1809,6 +2174,7 @@ mod tests {
                 identity: identity("service-monitor", "victoria"),
             }]
             .into(),
+            watches: Default::default(),
         };
         let pairs = crate::controller::resource_pairs();
         let inventory = crate::controller::ScrapeInventory::new(pairs.len(), &[]);
@@ -1837,39 +2203,210 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn core_discovery_follows_continue_tokens_and_skips_unneeded_resources() {
-        use axum::{Json, Router, http::Uri};
+    async fn core_discovery_lists_once_then_reads_the_watch_cache() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        use axum::{Json, Router, body::Body, http::Uri, response::IntoResponse};
+        let lists = Arc::new(AtomicUsize::new(0));
+        let server_lists = Arc::clone(&lists);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().fallback(move |uri: Uri| {
+                let lists = Arc::clone(&server_lists);
+                async move {
+                    assert_eq!(uri.path(), "/api/v1/pods");
+                    let query = uri.query().unwrap();
+                    if query.contains("watch=true") {
+                        // An open watch with no changes.
+                        let idle = futures_util::stream::pending::<Result<Vec<u8>, std::io::Error>>();
+                        return Body::from_stream(idle).into_response();
+                    }
+                    lists.fetch_add(1, Ordering::SeqCst);
+                    assert!(query.contains("limit=500"));
+                    let (name, token) = if query.contains("continue=second") {
+                        ("pod-b", "")
+                    } else {
+                        ("pod-a", "second")
+                    };
+                    Json(json!({"apiVersion":"v1","kind":"PodList","metadata":{"continue": token, "resourceVersion": "1"},
+                        "items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":name,"namespace":"apps"}}]}))
+                    .into_response()
+                }
+            })).await.unwrap();
+        });
+        let client = kube::Client::try_from(kube::Config::new(endpoint.parse().unwrap())).unwrap();
+        let mut watches = super::discovery_watch::DiscoveryWatches::default();
+        for _ in 0..3 {
+            let data = super::load_discovery_data(&client, &mut watches, false, true)
+                .await
+                .unwrap();
+            assert!(data.services.is_empty());
+            assert!(data.endpoints.is_empty());
+            assert_eq!(
+                data.pods["apps"]
+                    .iter()
+                    .map(super::name)
+                    .collect::<Vec<_>>(),
+                ["pod-a", "pod-b"]
+            );
+        }
+        // Two pages of one initial list; later refreshes read the cache.
+        assert_eq!(lists.load(Ordering::SeqCst), 2);
+        assert!(watches.services.running.is_none() && watches.endpoints.running.is_none());
+
+        let data = super::load_discovery_data(&client, &mut watches, false, false)
+            .await
+            .unwrap();
+        assert!(data.pods.is_empty());
+        assert!(watches.pods.running.is_none());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unsynchronized_core_watch_fails_discovery_instead_of_finding_no_pods() {
+        use axum::{
+            Router,
+            http::{StatusCode, Uri},
+            response::IntoResponse,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(|uri: Uri| async move {
+                    if uri.path() == "/api/v1/pods" {
+                        // An initial list that never completes.
+                        std::future::pending::<()>().await;
+                    }
+                    (StatusCode::FORBIDDEN, "denied").into_response()
+                }),
+            )
+            .await
+            .unwrap();
+        });
+        let client = kube::Client::try_from(kube::Config::new(endpoint.parse().unwrap())).unwrap();
+        let mut watches = super::discovery_watch::DiscoveryWatches {
+            sync_wait: std::time::Duration::from_millis(200),
+            ..Default::default()
+        };
+        let Err(error) = super::load_discovery_data(&client, &mut watches, false, true).await
+        else {
+            panic!("an unsynchronized Pod cache must not report an empty cluster");
+        };
+        assert!(error.to_string().contains("Pod watch is not synchronized"));
+        let Err(error) = super::load_discovery_data(&client, &mut watches, true, false).await
+        else {
+            panic!("a failed Service watch must fail discovery");
+        };
+        assert!(error.to_string().contains("watch failed"), "{error}");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn watched_discovery_matches_list_discovery_targets() {
+        use axum::{Json, Router, body::Body, http::Uri, response::IntoResponse};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
             axum::serve(listener, Router::new().fallback(|uri: Uri| async move {
-                assert_eq!(uri.path(), "/api/v1/pods");
-                let query = uri.query().unwrap();
-                assert!(query.contains("limit=500"));
-                let (name, token) = if query.contains("continue=second") {
-                    ("pod-b", "")
-                } else {
-                    ("pod-a", "second")
+                if uri.query().unwrap_or_default().contains("watch=true") {
+                    let idle = futures_util::stream::pending::<Result<Vec<u8>, std::io::Error>>();
+                    return Body::from_stream(idle).into_response();
+                }
+                let meta = |name: &str, labels: serde_json::Value| json!({
+                    "name": name, "namespace": "apps", "labels": labels,
+                    "annotations": {"note": "dropped"}, "uid": name, "resourceVersion": "1"
+                });
+                let (kind, items) = match uri.path() {
+                    "/api/v1/services" => ("ServiceList", json!([
+                        {"metadata": meta("api", json!({"app": "api"})),
+                         "spec": {"clusterIP": "10.1.0.1", "ports": [{"name": "metrics", "port": 9100, "targetPort": 8080}]}},
+                        {"metadata": meta("other", json!({"app": "other"})),
+                         "spec": {"ports": [{"name": "metrics", "port": 9100}]}}
+                    ])),
+                    "/api/v1/endpoints" => ("EndpointsList", json!([
+                        {"metadata": meta("api", json!({"app": "api"})),
+                         "subsets": [{"addresses": [{"ip": "10.0.0.1", "targetRef": {"kind": "Pod", "namespace": "apps", "name": "api-1"}},
+                                                    {"ip": "10.0.0.2"}],
+                                      "ports": [{"name": "metrics", "port": 8080}]}]}
+                    ])),
+                    "/api/v1/pods" => ("PodList", json!([
+                        {"metadata": meta("api-1", json!({"app": "api"})),
+                         "spec": {"nodeName": "node-a", "containers": [
+                             {"name": "app", "image": "app:1", "env": [{"name": "A", "value": "b"}],
+                              "ports": [{"name": "metrics", "containerPort": 8080}]},
+                             {"name": "sidecar", "image": "sidecar:1"}]},
+                         "status": {"podIP": "10.0.0.1", "phase": "Running"}},
+                        {"metadata": meta("api-0", json!({"app": "api"})),
+                         "spec": {"containers": [{"name": "app", "ports": [{"name": "metrics", "containerPort": 8080}]}]},
+                         "status": {"podIP": "10.0.0.3"}},
+                        {"metadata": meta("pending", json!({"app": "api"})),
+                         "spec": {"containers": [{"name": "app"}]}, "status": {"phase": "Pending"}}
+                    ])),
+                    path => panic!("unexpected request {path}"),
                 };
-                Json(json!({"apiVersion":"v1","kind":"PodList","metadata":{"continue": token},
-                    "items":[{"apiVersion":"v1","kind":"Pod","metadata":{"name":name,"namespace":"apps"}}]}))
+                Json(json!({"apiVersion": "v1", "kind": kind, "metadata": {"resourceVersion": "1"}, "items": items}))
+                    .into_response()
             })).await.unwrap();
         });
         let client = kube::Client::try_from(kube::Config::new(endpoint.parse().unwrap())).unwrap();
-        let data = super::load_discovery_data(&client, false, true)
+        let mut watches = super::discovery_watch::DiscoveryWatches::default();
+        let mut data = super::load_discovery_data(&client, &mut watches, true, true)
             .await
             .unwrap();
-        assert!(data.services.is_empty());
-        assert!(data.endpoints.is_empty());
+        data.allowed_target_namespaces = vec!["apps".into()];
+        let mut targets = DiscoveredTargets::new(100);
+        for pair in ["service-monitor", "pod-monitor"] {
+            let object = ScrapeObject {
+                namespace: "monitoring".into(),
+                name: pair.into(),
+                spec: json!({
+                    "selector": {"matchLabels": {"app": "api"}},
+                    "namespaceSelector": {"matchNames": ["apps"]},
+                    "endpoints": [{"port": "metrics"}],
+                }),
+            };
+            targets_for_object(pair, "prometheus", &object, &data, &mut targets).unwrap();
+        }
+        let targets = targets
+            .items
+            .iter()
+            .map(|target| (target.url.as_str(), target.labels.clone()))
+            .collect::<Vec<_>>();
+        let labels = |job: &str, kind: &str, name: &str, instance: &str| {
+            vec![
+                ("job".to_string(), job.to_string()),
+                ("namespace".into(), "apps".into()),
+                (kind.into(), name.into()),
+                ("instance".into(), instance.into()),
+            ]
+        };
+        // Expected values were produced by the list-based discovery this replaced.
         assert_eq!(
-            data.pods["apps"]
-                .iter()
-                .map(super::name)
-                .collect::<Vec<_>>(),
-            ["pod-a", "pod-b"]
+            targets,
+            [
+                (
+                    "http://10.0.0.1:8080/metrics",
+                    labels("service-monitor", "service", "api", "10.0.0.1:8080")
+                ),
+                (
+                    "http://10.0.0.2:8080/metrics",
+                    labels("service-monitor", "service", "api", "10.0.0.2:8080")
+                ),
+                (
+                    "http://10.0.0.3:8080/metrics",
+                    labels("pod-monitor", "pod", "api-0", "10.0.0.3:8080")
+                ),
+            ]
         );
         server.abort();
     }
+
     #[tokio::test]
     async fn scrape_failures_are_typed_and_internal_source_is_bounded() {
         use axum::{

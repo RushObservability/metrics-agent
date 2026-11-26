@@ -38,6 +38,9 @@ scrape:
   maxMetricNameBytes: 1024
   maxLineBytes: 65536
   # Empty allows scrape objects from every namespace visible to the agent.
+  # Probe and ScrapeConfig objects can name any host, so unless
+  # allowedTargetNamespaces is ["*"] they are only read from namespaces listed
+  # here explicitly.
   allowedNamespaces: []
   # Workload target namespaces for ServiceMonitor and PodMonitor. Empty keeps
   # each monitor in its own namespace. Set ["*"] to allow every namespace.
@@ -136,6 +139,11 @@ selfMetrics:
   enabled: false
 
 # Authenticated SRE health collection, configured independently of CRD targets.
+# The token is sent in the x-rush-internal-token header. sre-agent serves plain
+# HTTP, so an http url sends it unencrypted. With discovery enabled the agent
+# scrapes each Pod IP directly, which needs an encrypted CNI or service mesh to
+# keep the token off the wire; otherwise leave discovery off and use an https url
+# (for example a TLS-terminating proxy in front of sre-agent).
 sreMetrics:
   enabled: false
   url: ""

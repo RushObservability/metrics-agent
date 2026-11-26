@@ -106,10 +106,11 @@ mod tests {
     fn sample() -> CollectedMetric {
         CollectedMetric {
             name: "test_sample".into(),
+            target_labels: Default::default(),
             labels: vec![],
             value: 1.0,
             timestamp: 1,
-            help: String::new(),
+            help: Default::default(),
             metric_type: MetricType::Gauge,
         }
     }
