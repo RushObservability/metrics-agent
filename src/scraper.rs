@@ -2512,6 +2512,7 @@ mod tests {
                 .unwrap();
         let controller = crate::controller::Controller::new(client, config, sender.clone());
         let mut cache = super::TargetCache {
+            watches: Default::default(),
             refreshed_at: Some(Instant::now()),
             targets: (0..8)
                 .map(|index| ScrapeTarget {
@@ -2555,6 +2556,7 @@ mod tests {
                 .unwrap();
         let controller = crate::controller::Controller::new(client, config, sender.clone());
         let mut cache = super::TargetCache {
+            watches: Default::default(),
             refreshed_at: Some(Instant::now()),
             targets: vec![ScrapeTarget {
                 url: format!("{endpoint}/metrics"),
