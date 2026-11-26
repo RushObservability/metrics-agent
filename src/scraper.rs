@@ -24,7 +24,7 @@ use reqwest::Url;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use serde_json::Value;
 use tokio::{sync::mpsc, time};
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use tracing::{debug, warn};
 
 use crate::{
@@ -222,7 +222,7 @@ fn scrape_client(timeout: Duration, allowed: Vec<String>) -> Result<reqwest::Cli
 }
 
 async fn scrape_once(
-    controller: &Controller,
+    controller: &Arc<Controller>,
     http: &reqwest::Client,
     sender: &mpsc::Sender<ScrapeMessage>,
     target_cache: &mut TargetCache,
@@ -239,7 +239,7 @@ async fn scrape_once(
 }
 
 async fn scrape_once_inner(
-    controller: &Controller,
+    controller: &Arc<Controller>,
     http: &reqwest::Client,
     sender: &mpsc::Sender<ScrapeMessage>,
     target_cache: &mut TargetCache,
@@ -279,23 +279,28 @@ async fn scrape_once_inner(
     crate::queue_metrics::publish(sender, ScrapeMessage::Start { targets: total })
         .await
         .context("metrics remote-write channel closed")?;
+    // Each fetch runs on its own task so parsing uses every core and a slow
+    // remote-write publish below cannot leave in-flight requests unpolled past
+    // their timeout. Dropping the stream on shutdown aborts the tasks.
     let mut results = stream::iter((0..target_count).map(|index| {
         let targets = Arc::clone(&targets);
-        async move {
+        let controller = Arc::clone(controller);
+        let http = http.clone();
+        AbortOnDropHandle::new(tokio::spawn(async move {
             let target = &targets[index];
             let mut attempt =
                 crate::scrape_metrics::Attempt::new(&target.identity.pair, &target.identity.source);
-            let result = fetch_target(http, target, controller.config(), limits).await;
+            let result = fetch_target(&http, target, controller.config(), limits).await;
             attempt.finish(&result);
             result.map(|metrics| (index, metrics))
-        }
+        }))
     }))
     .buffer_unordered(controller.config().scrape_concurrency);
     let mut healthy = 0;
     let mut samples = 0;
     while let Some(result) = results.next().await {
         match result {
-            Ok((index, metrics)) => {
+            Ok(Ok((index, metrics))) => {
                 let identity = &targets[index].identity;
                 healthy += 1;
                 if controller.config().ui_enabled {
@@ -321,12 +326,13 @@ async fn scrape_once_inner(
                 }
                 samples += send_metric_chunks(sender, metrics).await?;
             }
-            Err(error) => debug!(
+            Ok(Err(error)) => debug!(
                 reason = error
                     .downcast_ref::<crate::scrape_metrics::Failure>()
                     .map_or("parse_error", |failure| failure.0.label()),
                 "scrape target failed"
             ),
+            Err(error) => warn!(%error, "scrape target task failed"),
         }
     }
     crate::queue_metrics::publish(
@@ -1944,5 +1950,99 @@ mod tests {
         );
         assert!(!metrics.contains("arbitrary-name"));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn slow_remote_write_consumer_does_not_time_out_healthy_targets() {
+        use axum::Router;
+        use clap::Parser;
+        use std::time::{Duration, Instant};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().fallback(|| async { "up 1\n" }))
+                .await
+                .unwrap();
+        });
+        let mut config = crate::config::Config::parse_from(["test"]);
+        config.scrape_allowed_destinations = vec!["127.0.0.1".into()];
+        // A config test briefly sets METRICS_AGENT_SCRAPE_ENABLED=false in the shared env.
+        config.scrape_enabled = true;
+        config.scrape_concurrency = 4;
+        let (sender, mut receiver) = mpsc::channel(1);
+        let client =
+            kube::Client::try_from(kube::Config::new("http://127.0.0.1:1".parse().unwrap()))
+                .unwrap();
+        let controller = crate::controller::Controller::new(client, config, sender.clone());
+        let mut cache = super::TargetCache {
+            refreshed_at: Some(Instant::now()),
+            targets: (0..8)
+                .map(|index| ScrapeTarget {
+                    url: format!("{endpoint}/{index}"),
+                    labels: vec![],
+                    identity: identity("service-monitor", "prometheus"),
+                })
+                .collect::<Vec<_>>()
+                .into(),
+        };
+        // The writer stalls well past the scrape timeout before draining.
+        let consumer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            while receiver.recv().await.is_some() {}
+        });
+        let http =
+            super::scrape_client(Duration::from_millis(300), vec!["127.0.0.1".into()]).unwrap();
+        let (targets, healthy, samples, ..) =
+            super::scrape_once_inner(&controller, &http, &sender, &mut cache)
+                .await
+                .unwrap();
+        assert_eq!((targets, healthy, samples), (8, 8, 8));
+        drop((controller, sender));
+        consumer.await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn aborting_a_scrape_cycle_cancels_in_flight_fetches() {
+        use clap::Parser;
+        use std::time::{Duration, Instant};
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mut config = crate::config::Config::parse_from(["test"]);
+        config.scrape_allowed_destinations = vec!["127.0.0.1".into()];
+        config.scrape_enabled = true;
+        let (sender, mut receiver) = mpsc::channel(4);
+        let client =
+            kube::Client::try_from(kube::Config::new("http://127.0.0.1:1".parse().unwrap()))
+                .unwrap();
+        let controller = crate::controller::Controller::new(client, config, sender.clone());
+        let mut cache = super::TargetCache {
+            refreshed_at: Some(Instant::now()),
+            targets: vec![ScrapeTarget {
+                url: format!("{endpoint}/metrics"),
+                labels: vec![],
+                identity: identity("service-monitor", "prometheus"),
+            }]
+            .into(),
+        };
+        let http = super::scrape_client(Duration::from_secs(30), vec!["127.0.0.1".into()]).unwrap();
+        let scrape = tokio::spawn(async move {
+            super::scrape_once_inner(&controller, &http, &sender, &mut cache).await
+        });
+        // The target accepts the request and never answers.
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buffer = [0u8; 1024];
+        assert!(socket.read(&mut buffer).await.unwrap() > 0);
+        assert!(matches!(
+            receiver.recv().await,
+            Some(crate::remote_write::ScrapeMessage::Start { targets: 1 })
+        ));
+        scrape.abort();
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            while socket.read(&mut buffer).await.unwrap_or(0) > 0 {}
+        })
+        .await;
+        assert!(closed.is_ok(), "fetch outlived the aborted scrape cycle");
     }
 }
