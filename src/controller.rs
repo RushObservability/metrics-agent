@@ -466,24 +466,23 @@ impl Controller {
         else {
             return Ok(());
         };
-        let prom_exists =
-            if self.status.snapshot().await.resource_pairs[key.pair].prometheus_available {
-                let prom_api = Api::<DynamicObject>::namespaced_with(
-                    self.client.clone(),
-                    &key.namespace,
-                    &pair.prometheus,
-                );
-                crate::queue_metrics::kube_operation(
-                    "get",
-                    pair.name,
-                    "prometheus",
-                    prom_api.get_opt(&key.name),
-                )
-                .await?
-                .is_some()
-            } else {
-                false
-            };
+        let prom_exists = if self.status.prometheus_available(key.pair).await {
+            let prom_api = Api::<DynamicObject>::namespaced_with(
+                self.client.clone(),
+                &key.namespace,
+                &pair.prometheus,
+            );
+            crate::queue_metrics::kube_operation(
+                "get",
+                pair.name,
+                "prometheus",
+                prom_api.get_opt(&key.name),
+            )
+            .await?
+            .is_some()
+        } else {
+            false
+        };
         let annotations = vm_object.metadata.annotations.as_ref();
         let owners = vm_object
             .metadata
