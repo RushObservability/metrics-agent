@@ -24,6 +24,8 @@ scrape:
   timeout: 10s
   discoveryRefreshInterval: 60s
   concurrency: 8
+  # Maximum distinct workload scrape URLs per refresh.
+  maxTargets: 10000
   # Per-target resource bounds. A target that exceeds any limit fails its
   # scrape without publishing a partial payload.
   maxResponseBytes: 4194304

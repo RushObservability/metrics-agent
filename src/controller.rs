@@ -20,6 +20,9 @@ use crate::{
     status::StatusStore,
 };
 
+mod scrape_inventory;
+pub(crate) use scrape_inventory::{ScrapeInventory, ScrapeObject};
+
 #[derive(Clone, Debug)]
 pub struct ResourcePair {
     pub name: &'static str,
@@ -150,6 +153,7 @@ pub struct Controller {
     client: kube::Client,
     config: Config,
     pairs: Vec<ResourcePair>,
+    pub(crate) scrape_inventory: Option<Arc<ScrapeInventory>>,
     pub status: Arc<StatusStore>,
     pub scrape_sender: tokio::sync::mpsc::Sender<ScrapeMessage>,
 }
@@ -175,10 +179,17 @@ impl Controller {
                 .clone()
                 .filter(|url| !url.trim().is_empty()),
         );
+        let scrape_inventory = config.scrape_enabled.then(|| {
+            Arc::new(ScrapeInventory::new(
+                pairs.len(),
+                &config.scrape_allowed_namespaces,
+            ))
+        });
         Arc::new(Self {
             client,
             config,
             pairs,
+            scrape_inventory,
             status,
             scrape_sender,
         })
@@ -224,14 +235,16 @@ impl Controller {
                     object_entries(&vm_objects, pair.prometheus_kind),
                 )
                 .await;
-            self.spawn_watcher(
+            self.seed_scrape_inventory(pair_index, false, &vm_objects)
+                .await;
+            tasks.push(self.spawn_watcher(
                 pair_index,
                 false,
                 vm_api,
                 queue_tx.clone(),
                 shutdown.clone(),
-                &mut tasks,
-            );
+                Duration::ZERO,
+            ));
 
             let prom_api = Api::<DynamicObject>::all_with(self.client.clone(), &pair.prometheus);
             match list_objects(&prom_api, pair.name, "prometheus").await {
@@ -246,14 +259,16 @@ impl Controller {
                             object_entries(&prom_objects, pair.prometheus_kind),
                         )
                         .await;
-                    self.spawn_watcher(
+                    self.seed_scrape_inventory(pair_index, true, &prom_objects)
+                        .await;
+                    tasks.push(self.spawn_watcher(
                         pair_index,
                         true,
                         prom_api,
                         queue_tx.clone(),
                         shutdown.clone(),
-                        &mut tasks,
-                    );
+                        Duration::ZERO,
+                    ));
                     info!(
                         resource_pair = pair.name,
                         "watching Prometheus and VictoriaMetrics scrape CRDs"
@@ -263,6 +278,17 @@ impl Controller {
                     self.status
                         .set_source_available(pair_index, true, false)
                         .await;
+                    if self.scrape_inventory.is_some() {
+                        self.seed_scrape_inventory(pair_index, true, &[]).await;
+                        tasks.push(self.spawn_watcher(
+                            pair_index,
+                            true,
+                            prom_api,
+                            queue_tx.clone(),
+                            shutdown.clone(),
+                            self.config.scrape_discovery_refresh_interval,
+                        ));
+                    }
                     info!(
                         resource_pair = pair.name,
                         "Prometheus scrape CRD is not installed; watching native VictoriaMetrics objects only"
@@ -304,6 +330,21 @@ impl Controller {
         result
     }
 
+    async fn seed_scrape_inventory(
+        &self,
+        pair: usize,
+        prometheus: bool,
+        objects: &[DynamicObject],
+    ) {
+        if let Some(inventory) = &self.scrape_inventory {
+            let mut selected = BTreeMap::new();
+            for object in objects {
+                inventory.insert(&mut selected, object);
+            }
+            inventory.replace(pair, prometheus, Some(selected)).await;
+        }
+    }
+
     fn spawn_watcher(
         &self,
         pair_index: usize,
@@ -311,59 +352,116 @@ impl Controller {
         api: Api<DynamicObject>,
         queue: mpsc::Sender<ReconcileKey>,
         shutdown: CancellationToken,
-        tasks: &mut Vec<JoinHandle<()>>,
-    ) {
+        initial_delay: Duration,
+    ) -> JoinHandle<()> {
         let status = self.status.clone();
+        let inventory = self.scrape_inventory.clone();
         let pair_name = self.pairs[pair_index].name;
         let pair_kind = self.pairs[pair_index].prometheus_kind;
-        tasks.push(crate::worker_metrics::spawn(crate::worker_metrics::Worker::Watcher, shutdown.clone(), async move {
-            loop {
-                let stream = watcher::watcher(api.clone(), watcher::Config::default());
-                tokio::pin!(stream);
-                while let Some(event) = tokio::select! {
-                    _ = shutdown.cancelled() => return,
-                    event = stream.next() => event,
-                } {
-                    let source = if prometheus { "prometheus" } else { "victoria" };
-                    crate::queue_metrics::operation("watch", pair_name, source, if event.is_ok() { "success" } else { "error" });
-                    match event {
-                        Ok(Event::Apply(object) | Event::InitApply(object)) => {
-                            let key = object_key(&object);
+        let absent_delay = self.config.scrape_discovery_refresh_interval;
+        let source = if prometheus { "prometheus" } else { "victoria" };
+        crate::worker_metrics::spawn(
+            crate::worker_metrics::Worker::Watcher,
+            shutdown.clone(),
+            async move {
+                let mut delay = initial_delay;
+                loop {
+                    if !delay.is_zero() {
+                        tokio::select! {
+                            _ = shutdown.cancelled() => return,
+                            _ = time::sleep(delay) => {}
+                        }
+                    }
+                    delay = Duration::from_secs(5);
+                    let stream = watcher::watcher(api.clone(), watcher::Config::default());
+                    tokio::pin!(stream);
+                    let mut pending = None;
+                    let mut optional_absent = false;
+                    while let Some(event) = tokio::select! {
+                        _ = shutdown.cancelled() => return,
+                        event = stream.next() => event,
+                    } {
+                        let outcome = if event.is_ok() { "success" } else { "error" };
+                        crate::queue_metrics::operation("watch", pair_name, source, outcome);
+                        match event {
+                            Ok(Event::Apply(object) | Event::InitApply(object)) => {
+                                if let Some(inventory) = &inventory {
+                                    if let Some(pending) = &mut pending {
+                                        inventory.insert(pending, &object);
+                                    } else {
+                                        inventory.apply(pair_index, prometheus, &object).await;
+                                    }
+                                }
+                                let key = object_key(&object);
+                                status
+                                    .upsert_object(
+                                        pair_index,
+                                        prometheus,
+                                        key,
+                                        !prometheus
+                                            && has_prometheus_owner_from_meta(
+                                                &object,
+                                                pair_kind,
+                                                &object.name_any(),
+                                            ),
+                                        serialized_size(&object),
+                                    )
+                                    .await;
+                                send_key(&queue, pair_index, &object).await;
+                            }
+                            Ok(Event::Delete(object)) => {
+                                if let Some(inventory) = &inventory {
+                                    inventory.delete(pair_index, prometheus, &object).await;
+                                }
+                                let key = object_key(&object);
+                                status.remove_object(pair_index, prometheus, &key).await;
+                                send_key(&queue, pair_index, &object).await;
+                            }
+                            Ok(Event::Init) => {
+                                pending = inventory.as_ref().map(|_| BTreeMap::new());
+                            }
+                            Ok(Event::InitDone) => {
+                                if let Some(inventory) = &inventory {
+                                    inventory
+                                        .replace(pair_index, prometheus, pending.take())
+                                        .await;
+                                    status
+                                        .set_source_available(pair_index, prometheus, true)
+                                        .await;
+                                }
+                            }
+                            Err(error) => {
+                                optional_absent =
+                                    prometheus && inventory.is_some() && watcher_not_found(&error);
+                                if optional_absent {
+                                    delay = absent_delay;
+                                } else {
+                                    error!(resource_pair = pair_name, prometheus, error = %error, "scrape CRD watcher failed; retrying");
+                                    status
+                                        .counters
+                                        .errors
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    if let Some(inventory) = &inventory {
+                        inventory
+                            .replace(pair_index, prometheus, optional_absent.then(BTreeMap::new))
+                            .await;
+                        if optional_absent {
                             status
-                                .upsert_object(
-                                    pair_index,
-                                    prometheus,
-                                    key,
-                                    !prometheus
-                                        && has_prometheus_owner_from_meta(
-                                            &object,
-                                            pair_kind,
-                                            &object.name_any(),
-                                        ),
-                                    serialized_size(&object),
-                                )
+                                .set_source_available(pair_index, prometheus, false)
                                 .await;
-                            send_key(&queue, pair_index, &object).await;
-                        }
-                        Ok(Event::Delete(object)) => {
-                            let key = object_key(&object);
-                            status.remove_object(pair_index, prometheus, &key).await;
-                            send_key(&queue, pair_index, &object).await;
-                        }
-                        Ok(Event::Init) | Ok(Event::InitDone) => {}
-                        Err(error) => {
-                            error!(resource_pair = pair_name, prometheus, error = %error, "scrape CRD watcher failed; retrying");
-                            status.counters.errors.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            break;
+                            status
+                                .replace_objects(pair_index, prometheus, std::iter::empty())
+                                .await;
                         }
                     }
                 }
-                tokio::select! {
-                    _ = shutdown.cancelled() => return,
-                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
-                }
-            }
-        }));
+            },
+        )
     }
 
     fn spawn_worker(
@@ -541,9 +639,32 @@ async fn list_objects(
     pair: &'static str,
     source: &'static str,
 ) -> Result<Vec<DynamicObject>, kube::Error> {
-    crate::queue_metrics::kube_operation("list", pair, source, api.list(&ListParams::default()))
-        .await
-        .map(|objects| objects.items)
+    let result = crate::queue_metrics::kube_operation(
+        "list",
+        pair,
+        source,
+        api.list(&ListParams::default()),
+    )
+    .await;
+    let outcome = match &result {
+        Ok(_) => "success",
+        Err(error) if source == "prometheus" && is_not_found(error) => "not_installed",
+        Err(kube::Error::Api(response)) if matches!(response.code, 401 | 403) => "forbidden",
+        Err(kube::Error::Api(response)) if matches!(response.code, 408 | 504) => "timeout",
+        Err(_) => "api_error",
+    };
+    crate::discovery_metrics::request(pair, source, outcome);
+    result.map(|objects| objects.items)
+}
+
+fn watcher_not_found(error: &watcher::Error) -> bool {
+    match error {
+        watcher::Error::InitialListFailed(error) | watcher::Error::WatchStartFailed(error) => {
+            is_not_found(error)
+        }
+        watcher::Error::WatchError(response) => response.code == 404,
+        _ => false,
+    }
 }
 
 fn is_not_found(error: &kube::Error) -> bool {

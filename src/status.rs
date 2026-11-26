@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::Entry},
     sync::Arc,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
@@ -8,6 +8,8 @@ use std::{
 use serde::Serialize;
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use tokio::sync::{Mutex, RwLock};
+
+const MAX_DIAGNOSTIC_METRIC_NAMES: usize = 20_000;
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct ResourcePairStatus {
@@ -73,6 +75,7 @@ pub struct CrdMetricStatus {
     pub samples: u64,
     pub total_series: u64,
     pub top_metrics: Vec<MetricCardinality>,
+    pub metric_names_truncated: bool,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -149,6 +152,8 @@ struct CrdMetricAccumulator {
     name: String,
     samples: u64,
     counts: HashMap<String, u64>,
+    total_series: u64,
+    metric_names_truncated: bool,
 }
 
 impl CrdMetricAccumulator {
@@ -175,8 +180,9 @@ impl CrdMetricAccumulator {
             namespace: self.namespace.clone(),
             name: self.name.clone(),
             samples: self.samples,
-            total_series: self.counts.values().sum(),
+            total_series: self.total_series,
             top_metrics,
+            metric_names_truncated: self.metric_names_truncated,
         }
     }
 }
@@ -189,6 +195,7 @@ struct MutableStatus {
     remote_write: RemoteWriteStatus,
     scrape: ScrapeStatus,
     crd_metrics: HashMap<String, CrdMetricAccumulator>,
+    crd_metric_names: usize,
 }
 
 #[derive(Default)]
@@ -408,7 +415,9 @@ impl StatusStore {
     }
 
     pub async fn begin_scrape(&self) {
-        self.mutable.write().await.crd_metrics.clear();
+        let mut state = self.mutable.write().await;
+        state.crd_metrics.clear();
+        state.crd_metric_names = 0;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -423,8 +432,12 @@ impl StatusStore {
         counts: impl IntoIterator<Item = MetricCardinality>,
     ) {
         let mut state = self.mutable.write().await;
-        let entry = state
-            .crd_metrics
+        let MutableStatus {
+            crd_metrics,
+            crd_metric_names,
+            ..
+        } = &mut *state;
+        let entry = crd_metrics
             .entry(key.clone())
             .or_insert_with(|| CrdMetricAccumulator {
                 key,
@@ -436,7 +449,15 @@ impl StatusStore {
             });
         entry.samples += samples;
         for metric in counts {
-            *entry.counts.entry(metric.name).or_default() += metric.series;
+            entry.total_series += metric.series;
+            match entry.counts.entry(metric.name) {
+                Entry::Occupied(mut count) => *count.get_mut() += metric.series,
+                Entry::Vacant(count) if *crd_metric_names < MAX_DIAGNOSTIC_METRIC_NAMES => {
+                    count.insert(metric.series);
+                    *crd_metric_names += 1;
+                }
+                Entry::Vacant(_) => entry.metric_names_truncated = true,
+            }
         }
     }
 
@@ -703,6 +724,60 @@ mod tests {
 
         store.begin_scrape().await;
         assert!(store.snapshot().await.crd_metric_cardinality.is_empty());
+    }
+
+    #[tokio::test]
+    async fn limits_diagnostic_names_across_objects_without_losing_totals() {
+        let store = StatusStore::new("test", true, ":7070", "/ui/", None);
+        let limit = super::MAX_DIAGNOSTIC_METRIC_NAMES;
+        store
+            .record_crd_metrics(
+                "first".into(),
+                "probe".into(),
+                "victoria".into(),
+                "apps".into(),
+                "first".into(),
+                limit as u64,
+                (0..limit).map(|index| MetricCardinality {
+                    name: format!("metric_{index}"),
+                    series: 1,
+                }),
+            )
+            .await;
+        for name in ["first", "second"] {
+            store
+                .record_crd_metrics(
+                    name.into(),
+                    "probe".into(),
+                    "victoria".into(),
+                    "apps".into(),
+                    name.into(),
+                    3,
+                    [
+                        MetricCardinality {
+                            name: "extra".into(),
+                            series: 1,
+                        },
+                        MetricCardinality {
+                            name: "metric_0".into(),
+                            series: 2,
+                        },
+                    ],
+                )
+                .await;
+        }
+        let snapshot = store.snapshot().await;
+        let first = &snapshot.crd_metric_cardinality[0];
+        assert!(first.metric_names_truncated);
+        assert_eq!(first.total_series, limit as u64 + 3);
+        assert_eq!(first.top_metrics[0].name, "metric_0");
+        assert_eq!(first.top_metrics[0].series, 3);
+        let second = &snapshot.crd_metric_cardinality[1];
+        assert!(second.metric_names_truncated);
+        assert_eq!(second.total_series, 3);
+        assert!(second.top_metrics.is_empty());
+        store.begin_scrape().await;
+        assert_eq!(store.mutable.read().await.crd_metric_names, 0);
     }
 
     #[tokio::test]
