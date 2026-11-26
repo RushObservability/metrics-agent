@@ -1,0 +1,51 @@
+{{- if and .Values.precedence.enabled .Values.rbac.admissionPolicy.enabled (.Capabilities.APIVersions.Has "admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy") }}
+{{- /* The agent only merge-patches the precedence annotation and ownerReferences (src/precedence.rs). */}}
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: {{ include "metrics-agent.fullname" . }}-scrape-patches
+  labels:
+    {{- include "metrics-agent.labels" . | nindent 4 }}
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["operator.victoriametrics.com"]
+        apiVersions: ["*"]
+        operations: ["UPDATE"]
+        resources: ["vmservicescrapes", "vmpodscrapes", "vmprobes", "vmscrapeconfigs"]
+  matchConditions:
+    - name: metrics-agent-service-account
+      expression: >-
+        request.userInfo.username == {{ printf "system:serviceaccount:%s:%s" .Release.Namespace (include "metrics-agent.serviceAccountName" .) | squote }}
+  variables:
+    - name: precedence
+      expression: "'operator.victoriametrics.com/ignore-prometheus-updates'"
+    - name: newAnnotations
+      expression: "object.metadata.?annotations.orValue({})"
+    - name: oldAnnotations
+      expression: "oldObject.metadata.?annotations.orValue({})"
+  validations:
+    - expression: "object.?spec == oldObject.?spec"
+      message: metrics-agent may not change the spec of a VictoriaMetrics scrape object
+    - expression: >-
+        object.metadata.?labels == oldObject.metadata.?labels &&
+        object.metadata.?finalizers == oldObject.metadata.?finalizers
+      message: metrics-agent may not change labels or finalizers of a VictoriaMetrics scrape object
+    - expression: >-
+        variables.newAnnotations.all(k, k == variables.precedence ||
+          (k in variables.oldAnnotations && variables.oldAnnotations[k] == variables.newAnnotations[k])) &&
+        variables.oldAnnotations.all(k, k == variables.precedence || k in variables.newAnnotations) &&
+        (!(variables.precedence in variables.newAnnotations) || variables.newAnnotations[variables.precedence] == 'enabled')
+      message: metrics-agent may only set or remove the ignore-prometheus-updates annotation
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "metrics-agent.fullname" . }}-scrape-patches
+  labels:
+    {{- include "metrics-agent.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "metrics-agent.fullname" . }}-scrape-patches
+  validationActions: [Deny]
+{{- end }}
