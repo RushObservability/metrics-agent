@@ -364,8 +364,6 @@ impl StatusStore {
             .filter(|object| object.converted)
             .count() as u64;
         status.native_count = status.victoria_count.saturating_sub(status.converted_count);
-        status.prometheus_objects = Self::object_statuses(&objects.prometheus);
-        status.victoria_objects = Self::object_statuses(&objects.victoria);
     }
 
     fn object_statuses(objects: &HashMap<String, ObjectState>) -> Vec<CrdObjectStatus> {
@@ -442,8 +440,23 @@ impl StatusStore {
         }
     }
 
+    pub(crate) async fn ready(&self) -> bool {
+        self.mutable.read().await.ready
+    }
+
+    pub(crate) async fn prometheus_available(&self, pair: usize) -> bool {
+        self.mutable.read().await.pairs[pair].prometheus_available
+    }
+
     pub async fn snapshot(&self) -> StatusSnapshot {
-        let state = self.mutable.read().await;
+        self.snapshot_with_details(true).await
+    }
+
+    pub(crate) async fn metrics_snapshot(&self) -> StatusSnapshot {
+        self.snapshot_with_details(false).await
+    }
+
+    async fn snapshot_with_details(&self, include_details: bool) -> StatusSnapshot {
         let pid = Pid::from_u32(std::process::id());
         let mut process = self.process.lock().await;
         process.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
@@ -451,17 +464,31 @@ impl StatusStore {
             .process(pid)
             .map(|process| (f64::from(process.cpu_usage()), process.memory()))
             .unwrap_or((0.0, 0));
-        let mut crd_metric_cardinality = state
-            .crd_metrics
-            .values()
-            .map(CrdMetricAccumulator::snapshot)
-            .collect::<Vec<_>>();
-        crd_metric_cardinality.sort_by(|left, right| left.key.cmp(&right.key));
+        drop(process);
+
+        let state = self.mutable.read().await;
+        // The pair summaries hold only counters. Materialize the sorted CRD
+        // inventory and per-object cardinality for the diagnostic API.
+        let mut resource_pairs = state.pairs.clone();
+        let mut crd_metric_cardinality = Vec::new();
+        if include_details {
+            for (pair, objects) in resource_pairs.iter_mut().zip(&state.objects) {
+                pair.prometheus_objects = Self::object_statuses(&objects.prometheus);
+                pair.victoria_objects = Self::object_statuses(&objects.victoria);
+            }
+            crd_metric_cardinality.extend(
+                state
+                    .crd_metrics
+                    .values()
+                    .map(CrdMetricAccumulator::snapshot),
+            );
+            crd_metric_cardinality.sort_by(|left, right| left.key.cmp(&right.key));
+        }
         StatusSnapshot {
             version: self.version.clone(),
             ready: state.ready,
             uptime_seconds: self.started.elapsed().as_secs(),
-            resource_pairs: state.pairs.clone(),
+            resource_pairs,
             totals: Totals {
                 crd_objects: state
                     .pairs
@@ -547,6 +574,12 @@ mod tests {
         assert_eq!(snapshot.resource_pairs[0].native_count, 1);
         assert_eq!(snapshot.resource_pairs[0].converted_count, 1);
         assert_eq!(snapshot.totals.crd_objects, 3);
+        let metrics = store.metrics_snapshot().await;
+        assert_eq!(metrics.totals.crd_objects, 3);
+        assert_eq!(metrics.resource_pairs[0].native_count, 1);
+        assert_eq!(metrics.resource_pairs[0].converted_count, 1);
+        assert!(metrics.resource_pairs[0].victoria_objects.is_empty());
+        assert!(metrics.resource_pairs[0].prometheus_objects.is_empty());
         assert_eq!(snapshot.resource_pairs[0].victoria_objects.len(), 2);
         assert_eq!(
             snapshot.resource_pairs[0].victoria_objects[1].name,
@@ -628,6 +661,13 @@ mod tests {
 
         let snapshot = store.snapshot().await;
         let cardinality = &snapshot.crd_metric_cardinality;
+        assert!(
+            store
+                .metrics_snapshot()
+                .await
+                .crd_metric_cardinality
+                .is_empty()
+        );
         assert_eq!(cardinality.len(), 1);
         assert_eq!(cardinality[0].samples, 19);
         assert_eq!(cardinality[0].total_series, 240);
