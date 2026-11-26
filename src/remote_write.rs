@@ -1,10 +1,14 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use jiff::Timestamp;
 use prost::Message;
-use reqwest::header::{CONTENT_ENCODING, CONTENT_TYPE};
+use reqwest::{
+    StatusCode,
+    header::{CONTENT_ENCODING, CONTENT_TYPE},
+};
 
 use crate::{metrics, status::StatusSnapshot};
 
@@ -201,28 +205,61 @@ async fn publish_inner(
     if let Some(tenant) = options.tenant.filter(|tenant| !tenant.is_empty()) {
         request = request.header("X-Rush-Tenant", tenant);
     }
-    attempt.finish("cancelled");
-    let response = request
-        .send()
-        .await
-        .inspect_err(|error| {
-            attempt.finish(if error.is_timeout() {
-                "timeout"
-            } else {
-                "transport_error"
-            });
-        })
-        .context("send remote-write payload")?;
-    if !response.status().is_success() {
-        let status = response.status();
-        attempt.finish(if status.is_client_error() {
-            "http_4xx"
-        } else if status.is_server_error() {
-            "http_5xx"
-        } else {
-            "http_other"
-        });
-        return Err(anyhow!("Rush rejected remote-write payload: HTTP {status}"));
+    // Keep the compressed body and sample timestamps identical across retries.
+    // Keep the writer serial so batches for a series are sent in order.
+    let request = request
+        .build()
+        .inspect_err(|_| attempt.finish("config_error"))?;
+    let mut backoffs = [Duration::from_millis(250), Duration::from_millis(500)].into_iter();
+    let mut backoff = backoffs.next();
+    loop {
+        let (error, outcome, retryable) = match client
+            .execute(
+                request
+                    .try_clone()
+                    .context("clone remote-write request body")?,
+            )
+            .await
+        {
+            Ok(response) if response.status().is_success() => break,
+            Ok(response) => {
+                let status = response.status();
+                let outcome = if status.is_client_error() {
+                    "http_4xx"
+                } else if status.is_server_error() {
+                    "http_5xx"
+                } else {
+                    "http_other"
+                };
+                (
+                    anyhow!("Rush rejected remote-write payload: HTTP {status}"),
+                    outcome,
+                    status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS,
+                )
+            }
+            Err(error) => {
+                let outcome = if error.is_timeout() {
+                    "timeout"
+                } else {
+                    "transport_error"
+                };
+                let retryable = error.is_connect()
+                    || error.is_timeout()
+                    || (error.is_request() && !error.is_builder());
+                (
+                    anyhow::Error::new(error.without_url()).context("send remote-write payload"),
+                    outcome,
+                    retryable,
+                )
+            }
+        };
+        let Some(delay) = backoff.filter(|_| retryable) else {
+            attempt.finish(outcome);
+            return Err(error);
+        };
+        options.delivery.retry(outcome);
+        tokio::time::sleep(delay).await;
+        backoff = backoffs.next();
     }
 
     attempt.finish("success");
@@ -811,6 +848,7 @@ async fn run_with_metrics(
     };
     let mut interval = tokio::time::interval(interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut draining = false;
     let mut cycle_active = false;
     let mut cycle_started: Option<std::time::Instant> = None;
     let mut cycle_sent_self = false;
@@ -819,7 +857,11 @@ async fn run_with_metrics(
     let mut cycle_error: Option<anyhow::Error> = None;
     loop {
         tokio::select! {
-            _ = shutdown.cancelled() => return,
+            biased;
+            _ = shutdown.cancelled(), if !draining => {
+                scrape_receiver.inner.close();
+                draining = true;
+            }
             message = crate::queue_metrics::recv(&mut scrape_receiver.inner, crate::queue_metrics::Queue::Publish) => {
                 let Some(message) = message else { return };
                 match message {
@@ -833,11 +875,10 @@ async fn run_with_metrics(
                     }
                     ScrapeMessage::Batch(metrics) => {
                         let Some(url) = url.as_deref() else { delivery.discarded(metrics.len(), "disabled"); continue };
-                        if cycle_error.is_some() { delivery.discarded(metrics.len(), "prior_chunk_failed"); continue; }
                         let snapshot = if cycle_sent_self {
                             None
                         } else {
-                            Some(status.snapshot().await)
+                            Some(status.metrics_snapshot().await)
                         };
                         match publish_inner(
                             &client,
@@ -857,17 +898,17 @@ async fn run_with_metrics(
                                 cycle_series += result.series;
                                 cycle_samples += result.samples;
                             }
-                            Err(error) => cycle_error = Some(error),
+                            Err(error) => { cycle_error.get_or_insert(error); }
                         }
                     }
                     ScrapeMessage::Complete { targets: _, healthy_targets: _, samples: _, error } => {
                         if let Some(error) = error {
-                            cycle_error = Some(anyhow!(error));
-                        } else if let Some(url) = url.as_deref() {
+                            cycle_error.get_or_insert_with(|| anyhow!(error));
+                        } else if let Some(url) = url.as_deref().filter(|_| !draining) {
                             // A scrape with no samples should still publish the
                             // agent's own health metrics.
                             if cycle_active && !cycle_sent_self && cycle_error.is_none() {
-                                let snapshot = status.snapshot().await;
+                                let snapshot = status.metrics_snapshot().await;
                                 match publish_inner(
                                     &client,
                                     url,
@@ -878,7 +919,7 @@ async fn run_with_metrics(
                                         tenant: tenant.as_deref(),
                                         extra_labels: &extra_labels,
                                         include_self: true,
-                                        delivery,
+                                delivery,
                                     },
                                 ).await {
                                     Ok(result) => {
@@ -904,10 +945,10 @@ async fn run_with_metrics(
                     }
                 }
             }
-            _ = interval.tick() => {
+            _ = interval.tick(), if !draining => {
                 if !cycle_active {
                     if let Some(url) = url.as_deref() {
-                        let snapshot = status.snapshot().await;
+                        let snapshot = status.metrics_snapshot().await;
                         // Once workload targets are active, their completed
                         // cycle is the meaningful "last payload". Do not
                         // overwrite that count with a small self-health-only
@@ -927,7 +968,7 @@ async fn run_with_metrics(
                                 tenant: tenant.as_deref(),
                                 extra_labels: &extra_labels,
                                 include_self: true,
-                                        delivery,
+                                delivery,
                             },
                         ).await {
                             Ok(result) => status.set_remote_write_result(Some(result.series), Some(result.samples), timestamp, started.elapsed().as_millis() as u64, None).await,
@@ -1472,29 +1513,27 @@ request_total{job="scrape",path="a\\b\"c\n",code="200"} 3.5 1700000000123
         }
     }
     #[tokio::test]
-    async fn failed_chunk_counts_skipped_samples_and_next_cycle_recovers() {
-        use axum::{Router, http::StatusCode};
-        use std::{
-            sync::{
-                Arc,
-                atomic::{AtomicUsize, Ordering},
-            },
-            time::Duration,
-        };
-        let hits = Arc::new(AtomicUsize::new(0));
-        let requests = hits.clone();
+    async fn drains_batches_with_retries_and_continues_after_permanent_failure() {
+        use axum::{Router, body::Bytes, http::StatusCode};
+        use std::sync::{Arc, Mutex};
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let received = Arc::clone(&requests);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
             axum::serve(
                 listener,
-                Router::new().fallback(move || {
-                    let requests = requests.clone();
+                Router::new().fallback(move |body: Bytes| {
+                    let received = Arc::clone(&received);
                     async move {
-                        if requests.fetch_add(1, Ordering::SeqCst) == 0 {
-                            StatusCode::SERVICE_UNAVAILABLE
-                        } else {
-                            StatusCode::OK
+                        let mut received = received.lock().unwrap();
+                        received.push(body);
+                        match received.len() {
+                            1 => StatusCode::SERVICE_UNAVAILABLE,
+                            2 => StatusCode::TOO_MANY_REQUESTS,
+                            4 => StatusCode::BAD_REQUEST,
+                            _ => StatusCode::OK,
                         }
                     }
                 }),
@@ -1503,75 +1542,80 @@ request_total{job="scrape",path="a\\b\"c\n",code="200"} 3.5 1700000000123
             .unwrap();
         });
         let status = crate::status::StatusStore::new("test", false, "", "/ui/", Some(url.clone()));
-        status
-            .set_scrape_status(ScrapeStatus {
-                enabled: true,
-                targets: 1,
-                ..Default::default()
-            })
-            .await;
-        let (tx, rx) = tokio::sync::mpsc::channel(10);
-        let sample = || {
-            super::parse_prometheus_text("workload 1\n", &[], 1, ScrapeLimits::default()).unwrap()
-        };
-        tx.send(super::ScrapeMessage::Start { targets: 1 })
-            .await
+        let (tx, rx) = tokio::sync::mpsc::channel(5);
+        tx.try_send(super::ScrapeMessage::Start { targets: 1 })
             .unwrap();
-        tx.send(super::ScrapeMessage::Batch(sample()))
-            .await
+        for value in 1..=3 {
+            let sample = super::parse_prometheus_text(
+                &format!("workload {value}\n"),
+                &[],
+                value,
+                ScrapeLimits::default(),
+            )
             .unwrap();
-        tx.send(super::ScrapeMessage::Batch(sample()))
-            .await
-            .unwrap();
-        tx.send(super::ScrapeMessage::Complete {
+            tx.try_send(super::ScrapeMessage::Batch(sample)).unwrap();
+        }
+        tx.try_send(super::ScrapeMessage::Complete {
             targets: 1,
             healthy_targets: 1,
-            samples: 2,
+            samples: 3,
             error: None,
         })
-        .await
         .unwrap();
-        tx.send(super::ScrapeMessage::Start { targets: 1 })
-            .await
-            .unwrap();
-        tx.send(super::ScrapeMessage::Batch(sample()))
-            .await
-            .unwrap();
-        tx.send(super::ScrapeMessage::Complete {
-            targets: 1,
-            healthy_targets: 1,
-            samples: 1,
-            error: None,
-        })
-        .await
-        .unwrap();
-        drop(tx);
         let metrics = crate::delivery_metrics::DeliveryMetrics::default();
-        super::run_with_metrics(
-            super::http_client(Duration::from_secs(1), Duration::from_secs(1)).unwrap(),
-            status,
-            rx,
-            Some(url),
-            None,
-            None,
-            BTreeMap::new(),
-            Duration::from_secs(3600),
-            tokio_util::sync::CancellationToken::new(),
-            &metrics,
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        shutdown.cancel();
+        tokio::time::timeout(
+            super::Duration::from_secs(4),
+            super::run_with_metrics(
+                super::http_client(super::Duration::from_secs(1), super::Duration::from_secs(1))
+                    .unwrap(),
+                Arc::clone(&status),
+                rx,
+                Some(url),
+                None,
+                None,
+                BTreeMap::new(),
+                super::Duration::from_secs(3600),
+                shutdown,
+                &metrics,
+            ),
         )
-        .await;
+        .await
+        .expect("writer should drain even while a sender is still alive");
+
+        assert!(tx.is_closed());
+        assert!(
+            status
+                .snapshot()
+                .await
+                .remote_write
+                .last_error
+                .unwrap()
+                .contains("400")
+        );
         let rendered = metrics.0.render();
         assert!(
-            rendered.contains("requests_total{outcome=\"http_5xx\"} 1"),
+            rendered.contains("retries_total{outcome=\"http_5xx\"} 1"),
             "{rendered}"
         );
         assert!(
-            rendered.contains("samples_total{outcome=\"discarded\"} 2"),
+            rendered.contains("retries_total{outcome=\"http_4xx\"} 1"),
             "{rendered}"
         );
-        assert!(rendered.contains("reason=\"prior_chunk_failed\"} 1"));
-        assert!(rendered.contains("samples_total{outcome=\"sent\"} 1"));
-        assert!(hits.load(Ordering::SeqCst) >= 2);
+        assert!(
+            rendered.contains("samples_total{outcome=\"discarded\"} 1"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("samples_total{outcome=\"sent\"} 2"),
+            "{rendered}"
+        );
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(requests[0], requests[1]);
+        assert_eq!(requests[0], requests[2]);
+        assert_ne!(requests[3], requests[4]);
         server.abort();
     }
 }

@@ -93,29 +93,46 @@ echo "  New version:     $version"
 echo "  Branch:          $release_branch"
 echo "  Tag after merge: $release_tag"
 
-# Run the release security gate before any branch exists, so a known advisory or
-# a leaked secret stops the release here. The release workflow does not repeat
-# it; the tests run below, after the version bump.
+# Gate releases locally before creating a branch, commit, or PR.
 for gate_tool in cargo-audit cargo-deny; do
   if ! command -v "$gate_tool" >/dev/null 2>&1; then
     echo "Required for the release security gate: $gate_tool. Install it with: cargo install --locked $gate_tool" >&2
     exit 1
   fi
 done
+for gate_tool in docker trivy; do
+  if ! command -v "$gate_tool" >/dev/null 2>&1; then
+    echo "Required for the release security gate: $gate_tool. Install it before running make release." >&2
+    exit 1
+  fi
+done
+
 echo "Release security gate: cargo audit"
 cargo audit
 echo "Release security gate: cargo deny"
 cargo deny check --hide-inclusion-graph advisories bans licenses sources
+
+echo "Release security gate: gitleaks"
 gitleaks_image="ghcr.io/gitleaks/gitleaks:v8.30.1@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f"
-if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-  echo "Release security gate: gitleaks"
-  docker run --rm --volume "${repo_root}:/repo:ro" "$gitleaks_image" git /repo --redact --no-banner
-elif command -v gitleaks >/dev/null 2>&1; then
-  echo "Release security gate: gitleaks"
-  gitleaks git "$repo_root" --redact --no-banner
-else
-  echo "Release security gate: skipping the secret scan locally (Docker and gitleaks are unavailable); the release PR's security workflow still runs it." >&2
-fi
+docker run --rm --volume "${repo_root}:/repo:ro" "$gitleaks_image" git /repo --redact --no-banner
+
+scan_release_image() (
+  scan_dir="$(mktemp -d "${TMPDIR:-/tmp}/metrics-agent-release-scan.XXXXXX")"
+  scan_image="metrics-agent-release-scan:${scan_dir##*.}"
+  cleanup_scan() {
+    docker image rm "$scan_image" >/dev/null 2>&1 || true
+    rm -f -- "$scan_dir/image.tar"
+    rmdir -- "$scan_dir"
+  }
+  trap cleanup_scan EXIT
+
+  echo "Release security gate: build image and scan with Trivy"
+  docker build --build-arg VERSION="$version" --tag "$scan_image" .
+  docker image save --output "$scan_dir/image.tar" "$scan_image"
+  trivy image --input "$scan_dir/image.tar" \
+    --format table --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1
+)
+scan_release_image
 
 if [[ "$dry_run" == "1" ]]; then
   echo "Dry run complete. No files, branches, commits, or pull requests were changed."
@@ -185,7 +202,7 @@ if [[ "$updated_lock_version" != "$version" ]]; then
   exit 1
 fi
 
-# The same checks CI runs on every push.
+# Check the updated version before opening the release PR.
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features --locked

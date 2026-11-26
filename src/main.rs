@@ -1,15 +1,18 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::Result;
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use metrics_agent::{
     config::{Config, configure_logging},
     controller::Controller,
     http, remote_write, scraper,
 };
+
+// Leave time for process exit within the chart's default 30-second grace period.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(25);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -86,11 +89,22 @@ async fn main() -> Result<()> {
         .into_future();
     tokio::pin!(server);
 
+    #[cfg(unix)]
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let terminate = async {
+        #[cfg(unix)]
+        {
+            sigterm.recv().await;
+        }
+        #[cfg(not(unix))]
+        std::future::pending::<()>().await;
+    };
+    let mut server_finished = false;
     let mut remote_writer_finished = false;
     tokio::select! {
         result = &mut server => {
+            server_finished = true;
             if let Err(error) = result { error!(%error, "HTTP server stopped unexpectedly"); }
-            shutdown.cancel();
         }
         result = controller_task => {
             match result {
@@ -98,27 +112,46 @@ async fn main() -> Result<()> {
                 Ok(Err(error)) => error!(%error, "controller stopped with an error"),
                 Err(error) => error!(%error, "controller task panicked"),
             }
-            shutdown.cancel();
         }
         result = &mut remote_write_task => {
             remote_writer_finished = true;
             match result { Ok(()) => error!("remote writer stopped unexpectedly"), Err(error) => error!(%error, "remote writer task failed") }
-            shutdown.cancel();
         }
-        _ = tokio::signal::ctrl_c() => {
-            info!("shutdown signal received");
-            shutdown.cancel();
-        }
+        _ = tokio::signal::ctrl_c() => info!("interrupt received"),
+        _ = terminate => info!("termination signal received"),
     }
 
-    let _ = server.await;
-    if let Some(ui_server) = ui_server {
-        ui_server.abort();
-        let _ = ui_server.await;
-    }
-    if !remote_writer_finished {
+    shutdown.cancel();
+    let graceful_shutdown = async {
+        tokio::join!(
+            async {
+                if !server_finished {
+                    let _ = server.await;
+                }
+            },
+            async {
+                if let Some(server) = ui_server.as_mut() {
+                    let _ = server.await;
+                }
+            },
+            async {
+                if !remote_writer_finished {
+                    if let Err(error) = (&mut remote_write_task).await {
+                        error!(%error, "remote writer task failed during shutdown");
+                    }
+                }
+            },
+        );
+    };
+    if tokio::time::timeout(SHUTDOWN_GRACE, graceful_shutdown)
+        .await
+        .is_err()
+    {
+        warn!("shutdown grace period expired");
         remote_write_task.abort();
-        let _ = remote_write_task.await;
+        if let Some(server) = ui_server {
+            server.abort();
+        }
     }
     Ok(())
 }
