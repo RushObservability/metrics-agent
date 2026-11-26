@@ -908,7 +908,7 @@ fn service_targets(
                 if endpoint_namespace.is_some_and(|namespace| namespace != service_namespace) {
                     continue;
                 }
-                let instance = format!("{ip}:{port}");
+                let instance = host_port(ip, port);
                 targets.push(ScrapeTarget {
                     url: build_url(scheme, &instance, path),
                     labels: vec![
@@ -964,7 +964,7 @@ fn pod_targets(
                 .get("scheme")
                 .and_then(Value::as_str)
                 .unwrap_or("http");
-            let instance = format!("{ip}:{port}");
+            let instance = host_port(ip, port);
             targets.push(ScrapeTarget {
                 url: build_url(scheme, &instance, path),
                 labels: vec![
@@ -1166,6 +1166,15 @@ fn pod_port(pod: &Value, requested: Option<&Value>) -> Option<u16> {
                 None
             }
         })
+}
+
+/// `ip:port` as Prometheus writes it: IPv6 is bracketed so the URL and the
+/// `instance` label parse.
+fn host_port(ip: &str, port: u16) -> String {
+    match ip.parse::<IpAddr>() {
+        Ok(ip) => std::net::SocketAddr::new(ip, port).to_string(),
+        Err(_) => format!("{ip}:{port}"),
+    }
 }
 
 fn build_url(scheme: &str, host: &str, path: &str) -> String {
@@ -1447,6 +1456,111 @@ mod tests {
                 .labels
                 .contains(&("instance".into(), "10.0.0.1:9100".into()))
         );
+    }
+
+    fn discovery_data_at(ip: &str, port: u16) -> DiscoveryData {
+        let mut data = discovery_data();
+        let endpoints = data
+            .endpoints
+            .get_mut(&("default".into(), "api".into()))
+            .unwrap();
+        endpoints["subsets"][0]["addresses"][0]["ip"] = json!(ip);
+        endpoints["subsets"][0]["ports"][0]["port"] = json!(port);
+        let pod = &mut data.pods.get_mut("default").unwrap()[0];
+        pod["status"]["podIP"] = json!(ip);
+        pod["spec"]["containers"][0]["ports"][0]["containerPort"] = json!(port);
+        data
+    }
+
+    /// One ServiceMonitor target and one PodMonitor target, expanded separately
+    /// because both point at the same address and would be deduplicated.
+    fn endpoint_and_pod_targets(data: &DiscoveryData) -> Vec<ScrapeTarget> {
+        let spec = json!({
+            "selector": {"matchLabels": {"app": "api"}},
+            "namespaceSelector": {"matchNames": ["default"]},
+            "endpoints": [{"port": "metrics"}]
+        });
+        let mut service = DiscoveredTargets::new(1);
+        service_targets(
+            &spec,
+            &identity("service-monitor", "prometheus"),
+            data,
+            &mut service,
+        )
+        .unwrap();
+        let mut pod = DiscoveredTargets::new(1);
+        pod_targets(
+            &spec,
+            &identity("pod-monitor", "prometheus"),
+            data,
+            &mut pod,
+        )
+        .unwrap();
+        let targets = [service.items, pod.items].concat();
+        assert_eq!(targets.len(), 2);
+        targets
+    }
+
+    #[tokio::test]
+    async fn ipv6_endpoints_and_pods_are_bracketed_and_scrapeable() {
+        use clap::Parser;
+        for target in endpoint_and_pod_targets(&discovery_data_at("fd00::1", 8080)) {
+            assert_eq!(target.url, "http://[fd00::1]:8080/metrics");
+            assert!(
+                target
+                    .labels
+                    .contains(&("instance".into(), "[fd00::1]:8080".into()))
+            );
+            assert!(validate_scrape_url(&target.url, &[]).is_ok());
+        }
+
+        let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route("/metrics", axum::routing::get(|| async { "up 1\n" })),
+            )
+            .await
+            .unwrap();
+        });
+        let mut config = crate::config::Config::parse_from(["test"]);
+        config.scrape_allowed_destinations = vec!["::1".into()];
+        let http =
+            super::scrape_client(std::time::Duration::from_secs(2), vec!["::1".into()]).unwrap();
+        for target in endpoint_and_pod_targets(&discovery_data_at("::1", port)) {
+            assert_eq!(target.url, format!("http://[::1]:{port}/metrics"));
+            let samples = super::fetch_target(&http, &target, &config, ScrapeLimits::default())
+                .await
+                .unwrap();
+            assert_eq!(samples[0].name, "up");
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn bracketed_ipv6_targets_still_hit_the_destination_policy() {
+        use clap::Parser;
+        let config = crate::config::Config::parse_from(["test"]);
+        let http = super::scrape_client(std::time::Duration::from_secs(1), vec![]).unwrap();
+        for ip in ["fd00:ec2::254", "fe80::1", "::1", "::ffff:169.254.169.254"] {
+            for target in endpoint_and_pod_targets(&discovery_data_at(ip, 8080)) {
+                assert_eq!(target.url, format!("http://[{ip}]:8080/metrics"));
+                assert!(validate_scrape_url(&target.url, &[]).is_err(), "{ip}");
+                let error = super::fetch_target(&http, &target, &config, ScrapeLimits::default())
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(
+                        error.downcast_ref::<crate::scrape_metrics::Failure>(),
+                        Some(crate::scrape_metrics::Failure(
+                            crate::scrape_metrics::Outcome::PolicyDenied
+                        ))
+                    ),
+                    "{ip}"
+                );
+            }
+        }
     }
 
     #[test]
