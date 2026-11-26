@@ -4,7 +4,7 @@
 //! by a watch, so a discovery refresh reads memory instead of re-listing every
 //! object in the cluster. Only the fields discovery reads are kept.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use anyhow::{Result, bail};
 use futures_util::StreamExt;
@@ -67,14 +67,15 @@ impl CoreWatch {
         }
     }
 
-    /// Trimmed objects in list order. The watch starts on first need and is
-    /// dropped, with its cache, when no monitor needs this kind.
+    /// Trimmed objects in list order, shared with the cache rather than copied.
+    /// The watch starts on first need and is dropped, with its cache, when no
+    /// monitor needs this kind.
     pub(super) async fn objects(
         &mut self,
         client: &Client,
         needed: bool,
         wait: Duration,
-    ) -> Result<Vec<Value>> {
+    ) -> Result<Vec<Arc<DynamicObject>>> {
         if !needed {
             self.running = None;
             return Ok(Vec::new());
@@ -100,7 +101,7 @@ impl CoreWatch {
             (&a.metadata.namespace, &a.metadata.name)
                 .cmp(&(&b.metadata.namespace, &b.metadata.name))
         });
-        Ok(objects.iter().map(|object| object.data.clone()).collect())
+        Ok(objects)
     }
 }
 

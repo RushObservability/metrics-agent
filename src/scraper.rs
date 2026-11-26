@@ -15,7 +15,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use futures_util::{StreamExt, stream};
 use jiff::{Timestamp, tz::Offset};
-use kube::Client;
+use kube::{Client, api::DynamicObject};
 use reqwest::Url;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use serde_json::Value;
@@ -56,9 +56,9 @@ struct ScrapeTarget {
 
 #[derive(Default)]
 struct DiscoveryData {
-    services: BTreeMap<String, Vec<Value>>,
-    endpoints: HashMap<(String, String), Value>,
-    pods: BTreeMap<String, Vec<Value>>,
+    services: BTreeMap<String, Vec<Arc<DynamicObject>>>,
+    endpoints: HashMap<(String, String), Arc<DynamicObject>>,
+    pods: BTreeMap<String, Vec<Arc<DynamicObject>>>,
     allowed_target_namespaces: Vec<String>,
     allowed_source_namespaces: Vec<String>,
 }
@@ -736,7 +736,7 @@ async fn load_discovery_data(
         services: index_namespaces(services),
         endpoints: endpoints
             .into_iter()
-            .map(|object| ((namespace(&object), name(&object)), object))
+            .map(|object| ((namespace(&object.data), name(&object.data)), object))
             .collect(),
         pods: index_namespaces(pods),
         allowed_target_namespaces: Vec::new(),
@@ -744,16 +744,19 @@ async fn load_discovery_data(
     })
 }
 
-fn index_namespaces(objects: Vec<Value>) -> BTreeMap<String, Vec<Value>> {
-    let mut index = BTreeMap::<String, Vec<Value>>::new();
+fn index_namespaces(objects: Vec<Arc<DynamicObject>>) -> BTreeMap<String, Vec<Arc<DynamicObject>>> {
+    let mut index = BTreeMap::<String, Vec<Arc<DynamicObject>>>::new();
     for object in objects {
-        index.entry(namespace(&object)).or_default().push(object);
+        index
+            .entry(namespace(&object.data))
+            .or_default()
+            .push(object);
     }
     index
 }
 
 fn objects_in_namespaces<'a>(
-    index: &'a BTreeMap<String, Vec<Value>>,
+    index: &'a BTreeMap<String, Vec<Arc<DynamicObject>>>,
     namespaces: &'a [String],
 ) -> impl Iterator<Item = &'a Value> {
     let all_namespaces = namespaces.iter().any(|name| name == "*");
@@ -766,7 +769,7 @@ fn objects_in_namespaces<'a>(
         .into_iter()
         .flatten()
         .filter_map(|namespace| index.get(namespace));
-    all.chain(selected).flatten()
+    all.chain(selected).flatten().map(|object| &object.data)
 }
 
 struct DiscoveredTargets {
@@ -890,7 +893,8 @@ fn service_targets(
         let service_name = name(service);
         let endpoint_data = data
             .endpoints
-            .get(&(service_namespace.clone(), service_name.clone()));
+            .get(&(service_namespace.clone(), service_name.clone()))
+            .map(|object| &object.data);
         for endpoint in endpoints {
             let path = endpoint
                 .get("path")
@@ -1279,8 +1283,10 @@ fn namespace(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::sync::Arc;
 
-    use serde_json::json;
+    use kube::api::DynamicObject;
+    use serde_json::{Value, json};
     use tokio::sync::mpsc;
 
     use super::{
@@ -1445,30 +1451,38 @@ mod tests {
         );
     }
 
+    fn cached(data: Value) -> Arc<DynamicObject> {
+        Arc::new(DynamicObject {
+            types: None,
+            metadata: Default::default(),
+            data,
+        })
+    }
+
     fn discovery_data() -> DiscoveryData {
         DiscoveryData {
             allowed_target_namespaces: vec!["default".into()],
             allowed_source_namespaces: Vec::new(),
-            services: index_namespaces(vec![json!({
+            services: index_namespaces(vec![cached(json!({
                 "metadata": {
                     "name": "api",
                     "namespace": "default",
                     "labels": {"app": "api"}
                 },
                 "spec": {"ports": [{"name": "metrics", "port": 9100}]}
-            })]),
+            }))]),
             endpoints: [(
                 ("default".into(), "api".into()),
-                json!({
+                cached(json!({
                     "subsets": [{
                         "addresses": [{"ip": "10.0.0.1"}],
                         "ports": [{"name": "metrics", "port": 9100}]
                     }]
-                }),
+                })),
             )]
             .into_iter()
             .collect(),
-            pods: index_namespaces(vec![json!({
+            pods: index_namespaces(vec![cached(json!({
                 "metadata": {
                     "name": "api-pod",
                     "namespace": "default",
@@ -1476,7 +1490,7 @@ mod tests {
                 },
                 "status": {"podIP": "10.0.0.2"},
                 "spec": {"containers": [{"ports": [{"name": "metrics", "containerPort": 8080}]}]}
-            })]),
+            }))]),
         }
     }
 
@@ -1521,13 +1535,15 @@ mod tests {
 
     fn discovery_data_at(ip: &str, port: u16) -> DiscoveryData {
         let mut data = discovery_data();
-        let endpoints = data
-            .endpoints
-            .get_mut(&("default".into(), "api".into()))
-            .unwrap();
+        let endpoints = &mut Arc::make_mut(
+            data.endpoints
+                .get_mut(&("default".into(), "api".into()))
+                .unwrap(),
+        )
+        .data;
         endpoints["subsets"][0]["addresses"][0]["ip"] = json!(ip);
         endpoints["subsets"][0]["ports"][0]["port"] = json!(port);
-        let pod = &mut data.pods.get_mut("default").unwrap()[0];
+        let pod = &mut Arc::make_mut(&mut data.pods.get_mut("default").unwrap()[0]).data;
         pod["status"]["podIP"] = json!(ip);
         pod["spec"]["containers"][0]["ports"][0]["containerPort"] = json!(port);
         data
@@ -2263,6 +2279,7 @@ mod tests {
         });
         let client = kube::Client::try_from(kube::Config::new(endpoint.parse().unwrap())).unwrap();
         let mut watches = super::discovery_watch::DiscoveryWatches::default();
+        let mut previous = None;
         for _ in 0..3 {
             let data = super::load_discovery_data(&client, &mut watches, false, true)
                 .await
@@ -2272,10 +2289,15 @@ mod tests {
             assert_eq!(
                 data.pods["apps"]
                     .iter()
-                    .map(super::name)
+                    .map(|pod| super::name(&pod.data))
                     .collect::<Vec<_>>(),
                 ["pod-a", "pod-b"]
             );
+            // Refreshes share the cached objects instead of copying them.
+            if let Some(previous) = &previous {
+                assert!(Arc::ptr_eq(&data.pods["apps"][0], previous));
+            }
+            previous = Some(Arc::clone(&data.pods["apps"][0]));
         }
         // Two pages of one initial list; later refreshes read the cache.
         assert_eq!(lists.load(Ordering::SeqCst), 2);
