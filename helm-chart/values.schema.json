@@ -30,7 +30,7 @@
           "required": ["name", "key"],
           "properties": {
             "name": { "type": "string", "maxLength": 253, "pattern": "^$|^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$" },
-            "key": { "type": "string", "minLength": 1, "maxLength": 253, "pattern": "^[A-Za-z0-9_.-]+$" }
+            "key": { "type": "string", "not": { "const": "sre-agent-internal-token" }, "minLength": 1, "maxLength": 253, "pattern": "^[A-Za-z0-9_.-]+$" }
           }
         }
       }

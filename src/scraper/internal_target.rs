@@ -1,7 +1,13 @@
 //! Credentials for this explicit operator-configured target never reach CRD targets.
 use anyhow::{Context, Result, bail};
-use k8s_openapi::api::core::v1::Endpoints;
-use kube::Api;
+use k8s_openapi::{
+    api::{
+        core::v1::{Pod, Service, ServicePort},
+        discovery::v1::EndpointSlice,
+    },
+    apimachinery::pkg::util::intstr::IntOrString,
+};
+use kube::{Api, api::ListParams};
 use reqwest::{Client, RequestBuilder, Url, header::HeaderValue};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -115,37 +121,152 @@ pub(super) async fn targets(config: &Config, client: kube::Client) -> Result<Vec
     else {
         return Ok(vec![base]);
     };
-    let api: Api<Endpoints> = Api::namespaced(client, namespace);
-    let endpoints = api
+    let services: Api<Service> = Api::namespaced(client.clone(), namespace);
+    let service = services
         .get(service)
         .await
-        .context("discover SRE metrics Service endpoints")?;
-    from_endpoints(config, &base, &endpoints)
+        .context("get SRE metrics Service")?;
+    let spec = service
+        .spec
+        .as_ref()
+        .context("SRE metrics Service lacks a spec")?;
+    let selector = spec
+        .selector
+        .as_ref()
+        .filter(|labels| !labels.is_empty())
+        .context("SRE metrics Service needs a Pod selector")?;
+    let label_query = selector
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let slices: Api<EndpointSlice> = Api::namespaced(client.clone(), namespace);
+    let pods: Api<Pod> = Api::namespaced(client, namespace);
+    let slice_params = ListParams::default()
+        .labels(&format!(
+            "kubernetes.io/service-name={}",
+            service
+                .metadata
+                .name
+                .as_deref()
+                .context("SRE Service lacks a name")?
+        ))
+        .limit(MAX_ENDPOINTS as u32);
+    let pod_params = ListParams::default()
+        .labels(&label_query)
+        .limit(MAX_ENDPOINTS as u32);
+    let (slices, pods) = tokio::try_join!(slices.list(&slice_params), pods.list(&pod_params))
+        .context("list SRE metrics EndpointSlices and Pods")?;
+    if slices
+        .metadata
+        .continue_
+        .is_some_and(|token| !token.is_empty())
+        || pods
+            .metadata
+            .continue_
+            .is_some_and(|token| !token.is_empty())
+        || slices.items.len() > MAX_ENDPOINTS
+        || pods.items.len() > MAX_ENDPOINTS
+    {
+        bail!("SRE metrics discovery exceeds the endpoint limit");
+    }
+    verified_targets(config, &base, &service, &slices.items, &pods.items)
 }
 
-fn from_endpoints(
+fn verified_targets(
     config: &Config,
     base: &ScrapeTarget,
-    endpoints: &Endpoints,
+    service: &Service,
+    slices: &[EndpointSlice],
+    pods: &[Pod],
 ) -> Result<Vec<ScrapeTarget>> {
-    let service = config
+    let service_name = config
         .sre_metrics_service
-        .as_ref()
+        .as_deref()
         .context("SRE Service is missing")?;
     let namespace = config
         .sre_metrics_namespace
-        .as_ref()
+        .as_deref()
         .context("SRE namespace is missing")?;
-    if endpoints.metadata.name.as_ref() != Some(service)
-        || endpoints.metadata.namespace.as_ref() != Some(namespace)
+    if service.metadata.name.as_deref() != Some(service_name)
+        || service.metadata.namespace.as_deref() != Some(namespace)
     {
-        bail!("SRE endpoint identity does not match the configured Service");
+        bail!("SRE metrics Service identity does not match configuration");
     }
+    let service_uid = service
+        .metadata
+        .uid
+        .as_deref()
+        .context("SRE metrics Service lacks a UID")?;
     let base_url = Url::parse(&base.url)?;
+    let service_spec = service
+        .spec
+        .as_ref()
+        .context("SRE metrics Service lacks a spec")?;
+    let selector = service_spec
+        .selector
+        .as_ref()
+        .filter(|labels| !labels.is_empty())
+        .context("SRE metrics Service needs a Pod selector")?;
+    let port = service_spec
+        .ports
+        .iter()
+        .flatten()
+        .find(|port| {
+            port.name.as_deref() == Some("http")
+                && port.protocol.as_deref().unwrap_or("TCP") == "TCP"
+                && Some(port.port) == base_url.port_or_known_default().map(i32::from)
+        })
+        .context("SRE metrics URL must match the Service HTTP port")?;
+    let pods: std::collections::HashMap<_, _> = pods
+        .iter()
+        .filter_map(|pod| {
+            let name = pod.metadata.name.as_deref()?;
+            let pod_spec = pod.spec.as_ref()?;
+            let status = pod.status.as_ref()?;
+            let labels = pod.metadata.labels.as_ref()?;
+            (pod.metadata.namespace.as_deref() == Some(namespace)
+                && pod.metadata.deletion_timestamp.is_none()
+                && !pod_spec.host_network.unwrap_or(false)
+                && selector
+                    .iter()
+                    .all(|(key, value)| labels.get(key) == Some(value))
+                && status
+                    .conditions
+                    .iter()
+                    .flatten()
+                    .any(|condition| condition.type_ == "Ready" && condition.status == "True"))
+            .then_some((name, pod))
+        })
+        .collect();
     let mut found = HashSet::new();
     let mut targets = Vec::new();
-    for subset in endpoints.subsets.iter().flatten() {
-        let Some(port) = subset
+    for slice in slices {
+        let Some(labels) = slice.metadata.labels.as_ref() else {
+            continue;
+        };
+        if slice.metadata.namespace.as_deref() != Some(namespace)
+            || labels.get("kubernetes.io/service-name").map(String::as_str) != Some(service_name)
+            || labels
+                .get("endpointslice.kubernetes.io/managed-by")
+                .map(String::as_str)
+                != Some("endpointslice-controller.k8s.io")
+            || !slice
+                .metadata
+                .owner_references
+                .iter()
+                .flatten()
+                .any(|owner| {
+                    owner.api_version == "v1"
+                        && owner.kind == "Service"
+                        && owner.name == service_name
+                        && owner.uid == service_uid
+                        && owner.controller == Some(true)
+                })
+        {
+            continue;
+        }
+        let Some(slice_port) = slice
             .ports
             .iter()
             .flatten()
@@ -153,49 +274,93 @@ fn from_endpoints(
                 port.name.as_deref() == Some("http")
                     && port.protocol.as_deref().unwrap_or("TCP") == "TCP"
             })
-            .map(|port| port.port)
+            .and_then(|port| port.port)
+            .and_then(|port| u16::try_from(port).ok())
+            .filter(|port| *port != 0)
         else {
             continue;
         };
-        let port = u16::try_from(port)
-            .ok()
-            .filter(|port| *port != 0)
-            .context("SRE metrics endpoint port is invalid")?;
-        for address in subset.addresses.iter().flatten() {
-            let ip = address
-                .ip
-                .parse::<std::net::IpAddr>()
-                .context("SRE endpoint address is not an IP")?;
-            let instance = std::net::SocketAddr::new(ip, port).to_string();
-            if !found.insert(instance.clone()) {
+        for endpoint in &slice.endpoints {
+            if !endpoint.conditions.as_ref().is_some_and(|condition| {
+                condition.ready == Some(true) && condition.terminating != Some(true)
+            }) {
                 continue;
             }
-            if targets.len() >= MAX_ENDPOINTS {
-                bail!("SRE metrics Service exceeds endpoint limit");
+            let Some(reference) = endpoint.target_ref.as_ref() else {
+                continue;
+            };
+            let Some(pod) = reference.name.as_deref().and_then(|name| pods.get(name)) else {
+                continue;
+            };
+            if reference.kind.as_deref() != Some("Pod")
+                || reference.namespace.as_deref() != Some(namespace)
+                || reference.uid.is_none()
+                || reference.uid != pod.metadata.uid
+                || pod_http_port(pod, port) != Some(i32::from(slice_port))
+            {
+                continue;
             }
-            let url = format!("{}://{instance}/metrics", base_url.scheme());
-            validate_scrape_url(&url, &config.scrape_allowed_destinations)?;
-            targets.push(ScrapeTarget {
-                url,
-                labels: vec![
-                    ("job".into(), "sre-agent".into()),
-                    ("service".into(), service.clone()),
-                    ("instance".into(), instance.clone()),
-                ],
-                identity: TargetIdentity {
-                    key: format!("{TARGET_KEY}/{instance}"),
-                    pair: "internal".into(),
-                    source: "internal".into(),
-                    namespace: namespace.clone(),
-                    name: service.clone(),
-                },
-            });
+            let Some(status) = pod.status.as_ref() else {
+                continue;
+            };
+            for address in &endpoint.addresses {
+                if status.pod_ip.as_ref() != Some(address)
+                    && !status.pod_ips.iter().flatten().any(|ip| ip.ip == *address)
+                {
+                    continue;
+                }
+                let Ok(ip) = address.parse::<std::net::IpAddr>() else {
+                    continue;
+                };
+                let instance = std::net::SocketAddr::new(ip, slice_port).to_string();
+                if !found.insert(instance.clone()) {
+                    continue;
+                }
+                if targets.len() >= MAX_ENDPOINTS {
+                    bail!("SRE metrics Service exceeds endpoint limit");
+                }
+                let url = format!("{}://{instance}/metrics", base_url.scheme());
+                validate_scrape_url(&url, &config.scrape_allowed_destinations)?;
+                targets.push(ScrapeTarget {
+                    url,
+                    labels: vec![
+                        ("job".into(), "sre-agent".into()),
+                        ("service".into(), service_name.into()),
+                        ("instance".into(), instance.clone()),
+                    ],
+                    identity: TargetIdentity {
+                        key: format!("{TARGET_KEY}/{instance}"),
+                        pair: "internal".into(),
+                        source: "internal".into(),
+                        namespace: namespace.into(),
+                        name: service_name.into(),
+                    },
+                });
+            }
         }
     }
     if targets.is_empty() {
-        bail!("SRE metrics Service has no ready HTTP endpoints");
+        bail!("SRE metrics Service has no verified ready Pod endpoints");
     }
     Ok(targets)
+}
+
+fn pod_http_port(pod: &Pod, service_port: &ServicePort) -> Option<i32> {
+    match service_port.target_port.as_ref() {
+        None => Some(service_port.port),
+        Some(IntOrString::Int(port)) => Some(*port),
+        Some(IntOrString::String(name)) => pod
+            .spec
+            .as_ref()?
+            .containers
+            .iter()
+            .flat_map(|container| container.ports.iter().flatten())
+            .find(|port| {
+                port.name.as_ref() == Some(name)
+                    && port.protocol.as_deref().unwrap_or("TCP") == "TCP"
+            })
+            .map(|port| port.container_port),
+    }
 }
 
 pub(super) async fn request(
@@ -404,41 +569,51 @@ mod tests {
         config
     }
 
-    fn endpoints(ports: &[u16]) -> Endpoints {
+    fn service() -> Service {
         serde_json::from_value(serde_json::json!({
-            "metadata": {"name":"sre-agent","namespace":"health"},
-            "subsets": ports.iter().map(|port| serde_json::json!({
-                "addresses":[{"ip":"127.0.0.1"}],
-                "notReadyAddresses":[{"ip":"127.0.0.2"}],
-                "ports":[{"name":"http","protocol":"TCP","port":port}]
-            })).collect::<Vec<_>>()
-        }))
-        .unwrap()
+            "apiVersion":"v1", "kind":"Service",
+            "metadata":{"name":"sre-agent", "namespace":"health", "uid":"service-uid"},
+            "spec":{"selector":{"component":"sre-agent"}, "ports":[{"name":"http","port":8081,"targetPort":"http"}]}
+        })).unwrap()
+    }
+
+    fn fixtures(ports: &[u16]) -> (Vec<EndpointSlice>, Vec<Pod>) {
+        ports.iter().enumerate().map(|(index, port)| {
+            let name = format!("sre-{index}");
+            let uid = format!("pod-{index}");
+            let slice = serde_json::from_value(serde_json::json!({
+                "apiVersion":"discovery.k8s.io/v1", "kind":"EndpointSlice",
+                "metadata":{"name": name, "namespace":"health",
+                    "labels":{"kubernetes.io/service-name":"sre-agent",
+                              "endpointslice.kubernetes.io/managed-by":"endpointslice-controller.k8s.io"},
+                    "ownerReferences":[{"apiVersion":"v1","kind":"Service","name":"sre-agent","uid":"service-uid","controller":true}]},
+                "addressType":"IPv4", "ports":[{"name":"http","port":port}],
+                "endpoints":[{"addresses":["127.0.0.1"], "conditions":{"ready":true},
+                    "targetRef":{"kind":"Pod","namespace":"health","name":name,"uid":uid}}]
+            })).unwrap();
+            let pod = serde_json::from_value(serde_json::json!({
+                "apiVersion":"v1","kind":"Pod",
+                "metadata":{"name":name,"namespace":"health","uid":uid,"labels":{"component":"sre-agent"}},
+                "spec":{"containers":[{"name":"sre-agent","ports":[{"name":"http","containerPort":port}]}]},
+                "status":{"podIP":"127.0.0.1","conditions":[{"type":"Ready","status":"True"}]}
+            })).unwrap();
+            (slice, pod)
+        }).unzip()
     }
 
     #[test]
-    fn service_fanout_is_ready_only_deduplicated_bounded_and_scoped() {
+    fn service_fanout_is_verified_and_deduplicated() {
         let file = TokenFile::new();
         let config = service_config(&file);
         let base = target(&config).unwrap().unwrap();
-        let selected = from_endpoints(&config, &base, &endpoints(&[8081, 8082, 8081])).unwrap();
+        let (mut slices, mut pods) = fixtures(&[8081, 8082, 8081]);
+        let selected = verified_targets(&config, &base, &service(), &slices, &pods).unwrap();
         assert_eq!(selected.len(), 2);
-        assert_ne!(selected[0].identity.key, selected[1].identity.key);
-        assert_eq!(selected[0].labels[2].1, "127.0.0.1:8081");
-        assert_eq!(selected[1].labels[2].1, "127.0.0.1:8082");
         assert!(selected.iter().all(is_internal));
-        assert!(from_endpoints(&config, &base, &endpoints(&[])).is_err());
-        let mut wrong = endpoints(&[8081]);
-        wrong.metadata.namespace = Some("other".into());
-        assert!(from_endpoints(&config, &base, &wrong).is_err());
-        let excessive = (1024..1281).collect::<Vec<_>>();
-        assert!(from_endpoints(&config, &base, &endpoints(&excessive)).is_err());
-        let mut partial = service_config(&file);
-        partial.sre_metrics_namespace = None;
-        assert!(target(&partial).is_err());
-        let mut external = service_config(&file);
-        external.sre_metrics_url = Some("http://other-service/metrics".into());
-        assert!(target(&external).is_err());
+        slices[0].metadata.owner_references.as_mut().unwrap()[0].uid = "old-service".into();
+        slices[1].endpoints[0].addresses[0] = "10.2.0.1".into();
+        pods[2].spec.as_mut().unwrap().host_network = Some(true);
+        assert!(verified_targets(&config, &base, &service(), &slices, &pods).is_err());
     }
 
     #[test]
@@ -489,14 +664,26 @@ mod tests {
                 axum::serve(listener, app).await.unwrap()
             }));
         }
-        let data = endpoints(&ports);
-        let api = Router::new().route(
-            "/api/v1/namespaces/health/endpoints/sre-agent",
-            get(move || {
-                let data = data.clone();
-                async move { Json(data) }
-            }),
-        );
+        let (slices, pods) = fixtures(&ports);
+        let api = Router::new()
+            .route(
+                "/api/v1/namespaces/health/services/sre-agent",
+                get(|| async { Json(service()) }),
+            )
+            .route(
+                "/apis/discovery.k8s.io/v1/namespaces/health/endpointslices",
+                get(move || {
+                    let slices = slices.clone();
+                    async move { Json(serde_json::json!({"metadata":{}, "items":slices})) }
+                }),
+            )
+            .route(
+                "/api/v1/namespaces/health/pods",
+                get(move || {
+                    let pods = pods.clone();
+                    async move { Json(serde_json::json!({"metadata":{}, "items":pods})) }
+                }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tasks.push(tokio::spawn(async move {
@@ -542,7 +729,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let app = Router::new()
             .route("/workload", get(|| async { "workload_ok 1\n" }))
-            .route("/api/v1/namespaces/health/endpoints/sre-agent", get(|| async {
+            .route("/api/v1/namespaces/health/services/sre-agent", get(|| async {
                 (StatusCode::FORBIDDEN, Json(serde_json::json!({"apiVersion":"v1","kind":"Status","status":"Failure","reason":"Forbidden","message":"forbidden","code":403})))
             }));
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
