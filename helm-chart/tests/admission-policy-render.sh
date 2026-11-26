@@ -3,7 +3,7 @@ set -euo pipefail
 chart_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 vap=(--api-versions admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy)
 rendered="$(helm template health "$chart_dir" --namespace monitoring "${vap[@]}")"
-for expected in 'kind: ValidatingAdmissionPolicy' 'kind: ValidatingAdmissionPolicyBinding' 'validationActions: [Deny]' 'operations: ["UPDATE"]' 'resources: ["vmservicescrapes", "vmpodscrapes", "vmprobes", "vmscrapeconfigs"]' "request.userInfo.username == 'system:serviceaccount:monitoring:health-metrics-agent'" 'object.?spec == oldObject.?spec'; do
+for expected in 'kind: ValidatingAdmissionPolicy' 'kind: ValidatingAdmissionPolicyBinding' 'validationActions: [Deny]' 'operations: ["UPDATE"]' 'resources: ["vmservicescrapes", "vmpodscrapes", "vmprobes", "vmscrapeconfigs"]' "request.userInfo.username == 'system:serviceaccount:monitoring:health-metrics-agent'" 'object.?spec == oldObject.?spec' 'o in oldObject.metadata.?ownerReferences.orValue([])'; do
   grep -Fq "$expected" <<<"$rendered" || { echo "missing admission policy setting: $expected" >&2; exit 1; }
 done
 grep -Fq "system:serviceaccount:monitoring:custom-sa'" <<<"$(helm template health "$chart_dir" --namespace monitoring "${vap[@]}" --set serviceAccount.name=custom-sa)" \
