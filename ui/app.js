@@ -450,14 +450,16 @@
     setText("drawerSeries", detail ? formatNumber(detail.total_series) : "No scrape data");
     setText("drawerSamples", detail ? formatNumber(detail.samples) : "No scrape data");
     const metrics = detail?.top_metrics || [];
-    setText("drawerMetricCount", metrics.length ? `${metrics.length} metrics` : "no samples");
-    if (!metrics.length) {
-      const empty = document.createElement("div");
-      empty.className = "memory-empty";
-      empty.textContent = "This CRD is being watched, but no successful metric scrape is associated with it yet.";
-      list.append(empty);
-      return;
+    setText("drawerMetricCount", metrics.length || detail?.metric_names_truncated ? `${metrics.length} metrics` : "no samples");
+    if (detail?.metric_names_truncated || !metrics.length) {
+      const notice = document.createElement("div");
+      notice.className = "memory-empty";
+      notice.textContent = detail?.metric_names_truncated
+        ? "The per-scrape limit for metric names was reached. Sample and series totals are complete."
+        : "This CRD is being watched, but no successful metric scrape is associated with it yet.";
+      list.append(notice);
     }
+    if (!metrics.length) return;
     const maximum = metrics[0]?.series || 1;
     for (const [index, metric] of metrics.entries()) {
       const row = document.createElement("div");

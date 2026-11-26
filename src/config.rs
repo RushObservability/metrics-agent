@@ -212,6 +212,15 @@ pub struct Config {
     )]
     pub scrape_concurrency: usize,
 
+    /// Maximum number of distinct workload scrape URLs per discovery refresh.
+    #[arg(
+        long,
+        env = "METRICS_AGENT_SCRAPE_MAX_TARGETS",
+        value_parser = parse_positive_usize,
+        default_value_t = 10_000
+    )]
+    pub scrape_max_targets: usize,
+
     /// Source namespaces whose scrape objects may create targets. Empty means
     /// all namespaces visible to the controller.
     #[arg(
@@ -478,6 +487,8 @@ mod tests {
             "45s",
             "--scrape-concurrency",
             "12",
+            "--scrape-max-targets",
+            "500",
             "--scrape-allowed-namespaces",
             "monitoring,apps",
             "--scrape-allowed-destinations",
@@ -540,6 +551,7 @@ mod tests {
             Duration::from_secs(45)
         );
         assert_eq!(config.scrape_concurrency, 12);
+        assert_eq!(config.scrape_max_targets, 500);
         assert_eq!(config.scrape_allowed_namespaces, ["monitoring", "apps"]);
         assert_eq!(
             config.scrape_allowed_destinations,
@@ -576,6 +588,7 @@ mod tests {
             Duration::from_secs(60)
         );
         assert_eq!(config.scrape_concurrency, 8);
+        assert_eq!(config.scrape_max_targets, 10_000);
         assert!(config.scrape_allowed_namespaces.is_empty());
         assert!(config.scrape_allowed_destinations.is_empty());
         assert_eq!(config.scrape_max_response_bytes, 4_194_304);
