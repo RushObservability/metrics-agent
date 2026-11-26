@@ -34,6 +34,7 @@ use crate::{
 };
 
 mod internal_target;
+mod selector;
 
 /// Reject incomplete internal scrape configuration before starting workers.
 pub fn validate_internal_metrics(config: &crate::config::Config) -> Result<()> {
@@ -61,6 +62,7 @@ struct DiscoveryData {
     services: BTreeMap<String, Vec<Value>>,
     endpoints: HashMap<(String, String), Value>,
     pods: BTreeMap<String, Vec<Value>>,
+    allowed_target_namespaces: Vec<String>,
 }
 
 #[derive(Default)]
@@ -77,6 +79,7 @@ impl TargetCache {
         inventory: &ScrapeInventory,
         refresh_interval: Duration,
         max_targets: usize,
+        allowed_target_namespaces: &[String],
     ) -> Result<(Arc<[ScrapeTarget]>, u64, bool)> {
         let fresh = self
             .refreshed_at
@@ -91,7 +94,15 @@ impl TargetCache {
         }
 
         let started = Instant::now();
-        match discover_targets(client, pairs, inventory, max_targets).await {
+        match discover_targets(
+            client,
+            pairs,
+            inventory,
+            max_targets,
+            allowed_target_namespaces,
+        )
+        .await
+        {
             Ok(targets) => {
                 crate::discovery_metrics::refresh("complete");
                 crate::worker_metrics::success("discovery");
@@ -243,6 +254,7 @@ async fn scrape_once_inner(
                 .context("scrape watch inventory is disabled")?,
             controller.config().scrape_discovery_refresh_interval,
             controller.config().scrape_max_targets,
+            &controller.config().scrape_allowed_target_namespaces,
         )
         .await?;
     let internal = internal_target::targets(controller.config(), controller.kube_client()).await;
@@ -673,10 +685,13 @@ async fn discover_targets(
     pairs: &[ResourcePair],
     inventory: &ScrapeInventory,
     max_targets: usize,
+    allowed_target_namespaces: &[String],
 ) -> Result<Vec<ScrapeTarget>> {
     let selected = inventory.selected(pairs).await?;
     let needs = |kind| selected.iter().any(|(pair, _, _)| *pair == kind);
-    let data = load_discovery_data(&client, needs("service-monitor"), needs("pod-monitor")).await?;
+    let mut data =
+        load_discovery_data(&client, needs("service-monitor"), needs("pod-monitor")).await?;
+    data.allowed_target_namespaces = allowed_target_namespaces.to_vec();
     let mut targets = DiscoveredTargets::new(max_targets);
     for (pair, source, object) in selected {
         targets_for_object(pair, source, &object, &data, &mut targets)?;
@@ -701,6 +716,7 @@ async fn load_discovery_data(
             .map(|object| ((namespace(&object), name(&object)), object))
             .collect(),
         pods: index_namespaces(pods),
+        allowed_target_namespaces: Vec::new(),
     })
 }
 
@@ -830,14 +846,37 @@ fn targets_for_object(
     }
 }
 
+fn monitor_selection(
+    spec: &Value,
+    identity: &TargetIdentity,
+    data: &DiscoveryData,
+) -> Option<(selector::LabelSelector, Vec<String>)> {
+    let selection = selector::LabelSelector::parse(spec.get("selector")).and_then(|selector| {
+        selector::selected_namespaces(
+            spec.get("namespaceSelector"),
+            &identity.namespace,
+            &data.allowed_target_namespaces,
+        )
+        .map(|namespaces| (selector, namespaces))
+    });
+    match selection {
+        Ok(selection) => Some(selection),
+        Err(error) => {
+            warn!(source = identity.source, kind = identity.pair, namespace = identity.namespace, name = identity.name, error = %error, "skipping invalid Kubernetes scrape selector");
+            None
+        }
+    }
+}
+
 fn service_targets(
     spec: &Value,
     identity: &TargetIdentity,
     data: &DiscoveryData,
     targets: &mut DiscoveredTargets,
 ) -> Result<()> {
-    let selector = spec.get("selector").unwrap_or(&Value::Null);
-    let namespaces = selected_namespaces(spec.get("namespaceSelector"), &identity.namespace);
+    let Some((selector, namespaces)) = monitor_selection(spec, identity, data) else {
+        return Ok(());
+    };
     let default_endpoints = [Value::Null];
     let endpoints = spec
         .get("endpoints")
@@ -845,10 +884,7 @@ fn service_targets(
         .map(Vec::as_slice)
         .unwrap_or(&default_endpoints);
     for service in objects_in_namespaces(&data.services, &namespaces) {
-        if !selector_matches(
-            service.get("metadata").and_then(|v| v.get("labels")),
-            selector,
-        ) {
+        if !selector.matches(service.pointer("/metadata/labels")) {
             continue;
         }
         let service_namespace = namespace(service);
@@ -866,7 +902,12 @@ fn service_targets(
                 .and_then(Value::as_str)
                 .unwrap_or("http");
             let requested_port = endpoint.get("port").or_else(|| endpoint.get("targetPort"));
-            for (ip, port) in endpoint_addresses(endpoint_data, requested_port, service) {
+            for (ip, port, endpoint_namespace) in
+                endpoint_addresses(endpoint_data, requested_port, service)
+            {
+                if endpoint_namespace.is_some_and(|namespace| namespace != service_namespace) {
+                    continue;
+                }
                 let instance = format!("{ip}:{port}");
                 targets.push(ScrapeTarget {
                     url: build_url(scheme, &instance, path),
@@ -890,8 +931,9 @@ fn pod_targets(
     data: &DiscoveryData,
     targets: &mut DiscoveredTargets,
 ) -> Result<()> {
-    let selector = spec.get("selector").unwrap_or(&Value::Null);
-    let namespaces = selected_namespaces(spec.get("namespaceSelector"), &identity.namespace);
+    let Some((selector, namespaces)) = monitor_selection(spec, identity, data) else {
+        return Ok(());
+    };
     let default_endpoints = [Value::Null];
     let endpoints = spec
         .get("podMetricsEndpoints")
@@ -900,7 +942,7 @@ fn pod_targets(
         .map(Vec::as_slice)
         .unwrap_or(&default_endpoints);
     for pod in objects_in_namespaces(&data.pods, &namespaces) {
-        if !selector_matches(pod.get("metadata").and_then(|v| v.get("labels")), selector) {
+        if !selector.matches(pod.pointer("/metadata/labels")) {
             continue;
         }
         let Some(ip) = pod
@@ -1025,7 +1067,7 @@ fn endpoint_addresses<'a>(
     endpoint_data: Option<&'a Value>,
     requested: Option<&Value>,
     service: &'a Value,
-) -> impl Iterator<Item = (&'a str, u16)> {
+) -> impl Iterator<Item = (&'a str, u16, Option<&'a str>)> {
     let requested = requested.and_then(value_string);
     endpoint_data
         .and_then(|data| data.get("subsets"))
@@ -1058,7 +1100,15 @@ fn endpoint_addresses<'a>(
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .filter_map(move |address| Some((address.get("ip")?.as_str()?, port?)))
+                .filter_map(move |address| {
+                    Some((
+                        address.get("ip")?.as_str()?,
+                        port?,
+                        address
+                            .pointer("/targetRef/namespace")
+                            .and_then(Value::as_str),
+                    ))
+                })
         })
 }
 
@@ -1116,45 +1166,6 @@ fn pod_port(pod: &Value, requested: Option<&Value>) -> Option<u16> {
                 None
             }
         })
-}
-
-fn selector_matches(labels: Option<&Value>, selector: &Value) -> bool {
-    selector
-        .get("matchLabels")
-        .and_then(Value::as_object)
-        .map(|required| {
-            required.iter().all(|(key, value)| {
-                labels
-                    .and_then(Value::as_object)
-                    .and_then(|labels| labels.get(key))
-                    == Some(value)
-            })
-        })
-        .unwrap_or(true)
-}
-
-fn selected_namespaces(selector: Option<&Value>, own: &str) -> Vec<String> {
-    let Some(selector) = selector else {
-        return vec![own.into()];
-    };
-    if selector.get("any").and_then(Value::as_bool) == Some(true) {
-        return vec!["*".into()];
-    }
-    let mut namespaces = selector
-        .get("matchNames")
-        .and_then(Value::as_array)
-        .map(|names| {
-            names
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .filter(|names: &Vec<String>| !names.is_empty())
-        .unwrap_or_else(|| vec![own.into()]);
-    namespaces.sort_unstable();
-    namespaces.dedup();
-    namespaces
 }
 
 fn build_url(scheme: &str, host: &str, path: &str) -> String {
@@ -1367,6 +1378,7 @@ mod tests {
 
     fn discovery_data() -> DiscoveryData {
         DiscoveryData {
+            allowed_target_namespaces: vec!["default".into()],
             services: index_namespaces(vec![json!({
                 "metadata": {
                     "name": "api",
@@ -1465,6 +1477,42 @@ mod tests {
                 .labels
                 .contains(&("namespace".into(), "default".into()))
         );
+    }
+
+    #[test]
+    fn monitor_discovery_intersects_expression_and_destination_policy() {
+        let mut data = discovery_data();
+        type Expand = fn(
+            &serde_json::Value,
+            &TargetIdentity,
+            &DiscoveryData,
+            &mut DiscoveredTargets,
+        ) -> anyhow::Result<()>;
+        let monitors: [(&str, Expand); 2] = [
+            ("service-monitor", service_targets),
+            ("pod-monitor", pod_targets),
+        ];
+        for (kind, expand) in monitors {
+            let identity = identity(kind, "prometheus");
+            let make_spec = |expression| {
+                json!({
+                    "namespaceSelector": {"any": true},
+                    "selector": {"matchExpressions": [expression]},
+                })
+            };
+            let mut targets = DiscoveredTargets::new(2);
+            data.allowed_target_namespaces = vec!["default".into()];
+            let different_app = make_spec(json!({"key":"app","operator":"In","values":["other"]}));
+            expand(&different_app, &identity, &data, &mut targets).unwrap();
+            assert!(targets.items.is_empty());
+            let matching_app = make_spec(json!({"key":"app","operator":"In","values":["api"]}));
+            data.allowed_target_namespaces.clear();
+            expand(&matching_app, &identity, &data, &mut targets).unwrap();
+            assert!(targets.items.is_empty());
+            data.allowed_target_namespaces.push("default".into());
+            expand(&matching_app, &identity, &data, &mut targets).unwrap();
+            assert_eq!(targets.items.len(), 1);
+        }
     }
 
     #[test]
@@ -1765,6 +1813,7 @@ mod tests {
                 &inventory,
                 Duration::from_secs(10),
                 1,
+                &[],
             )
             .await
             .unwrap();
@@ -1774,7 +1823,7 @@ mod tests {
         cache.refreshed_at = Some(Instant::now() - Duration::from_secs(21));
         assert!(
             cache
-                .get(client, &pairs, &inventory, Duration::from_secs(10), 1)
+                .get(client, &pairs, &inventory, Duration::from_secs(10), 1, &[])
                 .await
                 .is_err()
         );
