@@ -454,10 +454,10 @@ fn kubernetes_service_ip() -> Option<IpAddr> {
 }
 
 fn unsafe_destination_ip(ip: IpAddr) -> bool {
-    if let IpAddr::V6(v6) = ip {
-        if let Some(v4) = v6.to_ipv4() {
-            return unsafe_destination_ip(IpAddr::V4(v4));
-        }
+    if let IpAddr::V6(v6) = ip
+        && let Some(v4) = v6.to_ipv4()
+    {
+        return unsafe_destination_ip(IpAddr::V4(v4));
     }
     if kubernetes_service_ip() == Some(ip) {
         return true;
