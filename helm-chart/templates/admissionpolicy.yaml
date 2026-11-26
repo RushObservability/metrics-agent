@@ -1,5 +1,5 @@
 {{- if and .Values.precedence.enabled .Values.rbac.admissionPolicy.enabled (.Capabilities.APIVersions.Has "admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy") }}
-{{- /* The agent only merge-patches the precedence annotation and ownerReferences (src/precedence.rs). */}}
+{{- /* The agent only merge-patches the precedence annotation and removes ownerReferences (src/precedence.rs). */}}
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -38,6 +38,11 @@ spec:
         variables.oldAnnotations.all(k, k == variables.precedence || k in variables.newAnnotations) &&
         (!(variables.precedence in variables.newAnnotations) || variables.newAnnotations[variables.precedence] == 'enabled')
       message: metrics-agent may only set or remove the ignore-prometheus-updates annotation
+    # An added ownerReference with an unknown UID would make the garbage collector delete the object.
+    - expression: >-
+        object.metadata.?ownerReferences.orValue([]).all(o,
+          o in oldObject.metadata.?ownerReferences.orValue([]))
+      message: metrics-agent may only remove ownerReferences from a VictoriaMetrics scrape object
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
