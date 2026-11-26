@@ -298,6 +298,8 @@ async fn scrape_once_inner(
     .buffer_unordered(controller.config().scrape_concurrency);
     let mut healthy = 0;
     let mut samples = 0;
+    // Small targets share batches so each cycle costs few remote-write requests.
+    let mut chunk = Vec::with_capacity(METRIC_BATCH);
     while let Some(result) = results.next().await {
         match result {
             Ok(Ok((index, metrics))) => {
@@ -324,7 +326,7 @@ async fn scrape_once_inner(
                         )
                         .await;
                 }
-                samples += send_metric_chunks(sender, metrics).await?;
+                samples += send_metric_chunks(sender, &mut chunk, metrics).await?;
             }
             Ok(Err(error)) => debug!(
                 reason = error
@@ -334,6 +336,11 @@ async fn scrape_once_inner(
             ),
             Err(error) => warn!(%error, "scrape target task failed"),
         }
+    }
+    if !chunk.is_empty() {
+        crate::queue_metrics::publish(sender, ScrapeMessage::Batch(chunk))
+            .await
+            .context("metrics remote-write channel closed")?;
     }
     crate::queue_metrics::publish(
         sender,
@@ -661,27 +668,26 @@ fn account_response_bytes(total: &mut usize, chunk_bytes: usize, max_bytes: usiz
     Ok(())
 }
 
+const METRIC_BATCH: usize = 10_000;
+
+/// Appends metrics to the cycle's pending chunk and publishes every full one.
+/// The caller publishes the remainder before `Complete`.
 async fn send_metric_chunks(
     sender: &mpsc::Sender<ScrapeMessage>,
+    chunk: &mut Vec<CollectedMetric>,
     metrics: Vec<CollectedMetric>,
 ) -> Result<u64> {
     let samples = metrics.len() as u64;
-    let mut chunk = Vec::with_capacity(10_000);
     for metric in metrics {
         chunk.push(metric);
-        if chunk.len() == 10_000 {
+        if chunk.len() == METRIC_BATCH {
             crate::queue_metrics::publish(
                 sender,
-                ScrapeMessage::Batch(std::mem::replace(&mut chunk, Vec::with_capacity(10_000))),
+                ScrapeMessage::Batch(std::mem::replace(chunk, Vec::with_capacity(METRIC_BATCH))),
             )
             .await
             .context("metrics remote-write channel closed")?;
         }
-    }
-    if !chunk.is_empty() {
-        crate::queue_metrics::publish(sender, ScrapeMessage::Batch(chunk))
-            .await
-            .context("metrics remote-write channel closed")?;
     }
     Ok(samples)
 }
@@ -1694,35 +1700,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sends_metrics_in_bounded_batches() {
-        let metrics = (0..20_001)
-            .map(|index| CollectedMetric {
-                name: format!("metric_{index}"),
-                labels: Vec::new(),
-                value: index as f64,
-                timestamp: index,
-                help: String::new(),
-                metric_type: MetricType::Gauge,
-            })
-            .collect();
-        let (sender, mut receiver) = mpsc::channel(1);
-        let sender_for_task = sender.clone();
-        let task = tokio::spawn(async move { send_metric_chunks(&sender_for_task, metrics).await });
-        let mut sizes = Vec::new();
-        for _ in 0..3 {
-            match receiver.recv().await.unwrap() {
-                crate::remote_write::ScrapeMessage::Batch(metrics) => sizes.push(metrics.len()),
+    async fn sends_metrics_in_bounded_batches_across_targets() {
+        let metrics = |range: std::ops::Range<i64>| {
+            range
+                .map(|index| CollectedMetric {
+                    name: format!("metric_{index}"),
+                    labels: Vec::new(),
+                    value: index as f64,
+                    timestamp: index,
+                    help: String::new(),
+                    metric_type: MetricType::Gauge,
+                })
+                .collect()
+        };
+        let (sender, mut receiver) = mpsc::channel(4);
+        let mut chunk = Vec::new();
+        let first = send_metric_chunks(&sender, &mut chunk, metrics(0..6_000)).await;
+        let second = send_metric_chunks(&sender, &mut chunk, metrics(6_000..20_001)).await;
+        assert_eq!((first.unwrap(), second.unwrap()), (6_000, 14_001));
+        drop(sender);
+        let mut batches = Vec::new();
+        while let Some(message) = receiver.recv().await {
+            match message {
+                crate::remote_write::ScrapeMessage::Batch(metrics) => batches.push(metrics),
                 _ => panic!("unexpected scrape message"),
             }
         }
-        assert_eq!(task.await.unwrap().unwrap(), 20_001);
-        assert_eq!(sizes, vec![10_000, 10_000, 1]);
+        assert_eq!(
+            batches.iter().map(Vec::len).collect::<Vec<_>>(),
+            [10_000, 10_000]
+        );
+        assert_eq!(batches[1][0].name, "metric_10000");
+        assert_eq!(chunk.len(), 1);
+        assert_eq!(chunk[0].name, "metric_20000");
     }
 
     #[tokio::test]
     async fn empty_metric_batch_sends_nothing() {
         let (sender, mut receiver) = mpsc::channel(1);
-        assert_eq!(send_metric_chunks(&sender, Vec::new()).await.unwrap(), 0);
+        assert_eq!(
+            send_metric_chunks(&sender, &mut Vec::new(), Vec::new())
+                .await
+                .unwrap(),
+            0
+        );
         drop(sender);
         assert!(receiver.recv().await.is_none());
     }
@@ -1739,7 +1760,9 @@ mod tests {
             help: String::new(),
             metric_type: MetricType::Gauge,
         };
-        let error = send_metric_chunks(&sender, vec![metric]).await.unwrap_err();
+        let error = send_metric_chunks(&sender, &mut Vec::new(), vec![metric; 10_000])
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("channel closed"));
     }
 
@@ -2044,5 +2067,99 @@ mod tests {
         })
         .await;
         assert!(closed.is_ok(), "fetch outlived the aborted scrape cycle");
+    }
+
+    #[tokio::test]
+    async fn small_targets_share_remote_write_batches_and_keep_per_target_counts() {
+        use axum::{Router, http::StatusCode, http::Uri};
+        use clap::Parser;
+        use std::time::{Duration, Instant};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().fallback(|uri: Uri| async move {
+                    if uri.path() == "/broken" {
+                        (StatusCode::INTERNAL_SERVER_ERROR, "")
+                    } else {
+                        (StatusCode::OK, "a 1\nb 2\nc 3\n")
+                    }
+                }),
+            )
+            .await
+            .unwrap();
+        });
+        let mut config = crate::config::Config::parse_from(["test"]);
+        config.scrape_allowed_destinations = vec!["127.0.0.1".into()];
+        config.scrape_enabled = true;
+        config.ui_enabled = true;
+        let (sender, mut receiver) = mpsc::channel(2);
+        let client =
+            kube::Client::try_from(kube::Config::new("http://127.0.0.1:1".parse().unwrap()))
+                .unwrap();
+        let controller = crate::controller::Controller::new(client, config, sender.clone());
+        let mut targets = (0..40)
+            .map(|index| ScrapeTarget {
+                url: format!("{endpoint}/{index}"),
+                labels: vec![],
+                identity: TargetIdentity {
+                    key: format!("prometheus:service-monitor:apps/m{index}"),
+                    name: format!("m{index}"),
+                    ..identity("service-monitor", "prometheus")
+                },
+            })
+            .collect::<Vec<_>>();
+        targets.push(ScrapeTarget {
+            url: format!("{endpoint}/broken"),
+            labels: vec![],
+            identity: identity("service-monitor", "prometheus"),
+        });
+        let mut cache = super::TargetCache {
+            refreshed_at: Some(Instant::now()),
+            targets: targets.into(),
+        };
+        let consumer = tokio::spawn(async move {
+            let mut messages = Vec::new();
+            while let Some(message) = receiver.recv().await {
+                messages.push(message);
+            }
+            messages
+        });
+        let http = super::scrape_client(Duration::from_secs(5), vec!["127.0.0.1".into()]).unwrap();
+        controller.status.begin_scrape().await;
+        let (total, healthy, samples, ..) =
+            super::scrape_once_inner(&controller, &http, &sender, &mut cache)
+                .await
+                .unwrap();
+        assert_eq!((total, healthy, samples), (41, 40, 120));
+        let snapshot = controller.status.snapshot().await;
+        assert_eq!(snapshot.crd_metric_cardinality.len(), 40);
+        assert!(
+            snapshot
+                .crd_metric_cardinality
+                .iter()
+                .all(|detail| detail.samples == 3)
+        );
+        drop((controller, sender));
+        let messages = consumer.await.unwrap();
+        assert_eq!(messages.len(), 3, "expected Start, one Batch, Complete");
+        assert!(matches!(
+            messages[0],
+            crate::remote_write::ScrapeMessage::Start { targets: 41 }
+        ));
+        assert!(
+            matches!(&messages[1], crate::remote_write::ScrapeMessage::Batch(batch) if batch.len() == 120)
+        );
+        assert!(matches!(
+            messages[2],
+            crate::remote_write::ScrapeMessage::Complete {
+                targets: 41,
+                healthy_targets: 40,
+                samples: 120,
+                error: None
+            }
+        ));
+        server.abort();
     }
 }
