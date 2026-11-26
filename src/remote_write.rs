@@ -837,7 +837,7 @@ async fn run_with_metrics(
                         let snapshot = if cycle_sent_self {
                             None
                         } else {
-                            Some(status.snapshot().await)
+                            Some(status.metrics_snapshot().await)
                         };
                         match publish_inner(
                             &client,
@@ -867,7 +867,7 @@ async fn run_with_metrics(
                             // A scrape with no samples should still publish the
                             // agent's own health metrics.
                             if cycle_active && !cycle_sent_self && cycle_error.is_none() {
-                                let snapshot = status.snapshot().await;
+                                let snapshot = status.metrics_snapshot().await;
                                 match publish_inner(
                                     &client,
                                     url,
@@ -907,7 +907,7 @@ async fn run_with_metrics(
             _ = interval.tick() => {
                 if !cycle_active {
                     if let Some(url) = url.as_deref() {
-                        let snapshot = status.snapshot().await;
+                        let snapshot = status.metrics_snapshot().await;
                         // Once workload targets are active, their completed
                         // cycle is the meaningful "last payload". Do not
                         // overwrite that count with a small self-health-only

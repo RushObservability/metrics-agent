@@ -157,11 +157,11 @@ async fn livez() -> &'static str {
 }
 
 async fn readyz(State(controller): State<Arc<Controller>>) -> impl IntoResponse {
-    readiness_response(controller.status.snapshot().await.ready)
+    readiness_response(controller.status.ready().await)
 }
 
 async fn prometheus_metrics(State(controller): State<Arc<Controller>>) -> impl IntoResponse {
-    let body = metrics::render(&controller.status.snapshot().await);
+    let body = metrics::render(&controller.status.metrics_snapshot().await);
     (
         [(
             header::CONTENT_TYPE,
