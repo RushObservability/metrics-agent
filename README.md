@@ -157,6 +157,13 @@ example NetworkPolicy rules with the addresses used by your cluster.
 Rule and Alertmanager resources are not watched because they do not define
 scrape targets.
 
+`ServiceMonitor` and `PodMonitor` targets stay in the monitor's own namespace
+unless `scrape.allowedTargetNamespaces` lists more, and their endpoint `scheme`
+must be `http` or `https`. `Probe` and `ScrapeConfig` objects can name any host,
+so while that restriction is on they are only read from namespaces listed
+explicitly in `scrape.allowedNamespaces`. Set `allowedTargetNamespaces: ["*"]`
+to accept them from every allowed namespace.
+
 VictoriaMetrics objects created by the Prometheus converter carry an owner
 reference to their source object. metrics-agent uses that reference to make the
 choice:
@@ -217,6 +224,7 @@ Every setting has a CLI flag and an environment-variable form. Run
 | `METRICS_AGENT_SCRAPE_DISCOVERY_REFRESH_INTERVAL` | `60s` | Maximum age of the target cache |
 | `METRICS_AGENT_SCRAPE_CONCURRENCY` | `8` | Concurrent target limit |
 | `METRICS_AGENT_SCRAPE_ALLOWED_NAMESPACES` | empty | Comma-separated namespaces allowed to define targets |
+| `METRICS_AGENT_SCRAPE_ALLOWED_TARGET_NAMESPACES` | empty | ServiceMonitor and PodMonitor destination namespaces; empty keeps each monitor in its own namespace, `*` allows all |
 | `METRICS_AGENT_SCRAPE_ALLOWED_DESTINATIONS` | empty | Exact hosts, IPs, or `*.suffix` exceptions to destination blocking |
 | `METRICS_AGENT_SCRAPE_MAX_RESPONSE_BYTES` | `4194304` | Response-body limit per target |
 | `METRICS_AGENT_SCRAPE_MAX_SAMPLES_PER_TARGET` | `50000` | Parsed sample limit per target |
