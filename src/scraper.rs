@@ -998,13 +998,20 @@ fn static_targets(
         .and_then(Value::as_str)
         .unwrap_or("/metrics");
     for config in configs {
-        let labels = config
+        let mut labels = config
             .get("labels")
             .and_then(Value::as_object)
             .into_iter()
             .flatten()
             .map(|(key, value)| (key.clone(), value.as_str().unwrap_or_default().to_string()))
             .collect::<Vec<_>>();
+        if let Some((invalid, _)) = labels.iter().find(|(key, _)| !valid_static_label_name(key)) {
+            warn!(source = identity.source, kind = identity.pair, namespace = identity.namespace, name = identity.name, label = %invalid, "skipping static scrape config with an invalid label name");
+            continue;
+        }
+        // The CRD's own namespace always wins so a static label cannot claim
+        // another tenant's namespace.
+        labels.retain(|(key, _)| key != "namespace");
         for target in config
             .get("targets")
             .and_then(Value::as_array)
@@ -1019,6 +1026,7 @@ fn static_targets(
             if !target_labels.iter().any(|(key, _)| key == "instance") {
                 target_labels.push(("instance".into(), target.to_string()));
             }
+            target_labels.push(("namespace".into(), identity.namespace.clone()));
             targets.push(ScrapeTarget {
                 url: normalize_target(target, scheme, path),
                 labels: target_labels,
@@ -1027,6 +1035,16 @@ fn static_targets(
         }
     }
     Ok(())
+}
+
+/// Prometheus label names, excluding the reserved `__` prefix.
+fn valid_static_label_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|first| first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+        && !name.starts_with("__")
 }
 
 fn probe_targets(
@@ -1056,6 +1074,7 @@ fn probe_targets(
             labels: vec![
                 ("job".into(), identity.name.clone()),
                 ("instance".into(), target.into()),
+                ("namespace".into(), identity.namespace.clone()),
             ],
             identity: identity.clone(),
         })?;
@@ -1648,6 +1667,33 @@ mod tests {
                 .labels
                 .contains(&("instance".into(), "https://example.com/a?x=1".into()))
         );
+        assert!(
+            targets[0]
+                .labels
+                .contains(&("namespace".into(), "monitoring".into()))
+        );
+    }
+
+    #[test]
+    fn static_labels_cannot_spoof_namespace_or_use_invalid_names() {
+        let spec = json!({
+            "staticConfigs": [
+                {"targets": ["node-a:9100"], "labels": {"namespace": "payments", "team": "a"}},
+                {"targets": ["node-b:9100"], "labels": {"__address__": "x"}},
+                {"targets": ["node-c:9100"], "labels": {"bad-name": "x"}}
+            ]
+        });
+        let mut targets = DiscoveredTargets::new(3);
+        static_targets(&spec, &identity("scrape-config", "victoria"), &mut targets).unwrap();
+        let targets = targets.items;
+        assert_eq!(targets.len(), 1);
+        let namespaces = targets[0]
+            .labels
+            .iter()
+            .filter(|(key, _)| key == "namespace")
+            .collect::<Vec<_>>();
+        assert_eq!(namespaces, [&("namespace".into(), "monitoring".into())]);
+        assert!(targets[0].labels.contains(&("team".into(), "a".into())));
     }
 
     #[test]
