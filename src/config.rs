@@ -230,6 +230,15 @@ pub struct Config {
     )]
     pub scrape_allowed_namespaces: Vec<String>,
 
+    /// Destination namespaces for ServiceMonitor and PodMonitor targets.
+    /// Empty restricts each monitor to its own namespace. Use * to allow all.
+    #[arg(
+        long,
+        env = "METRICS_AGENT_SCRAPE_ALLOWED_TARGET_NAMESPACES",
+        value_delimiter = ','
+    )]
+    pub scrape_allowed_target_namespaces: Vec<String>,
+
     /// Exact hosts, IP addresses, or `*.suffix` patterns that may override the
     /// built-in destination denylist. This is intentionally empty by default.
     #[arg(
